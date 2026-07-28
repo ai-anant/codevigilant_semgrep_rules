@@ -87,6 +87,10 @@ rules:
           - pattern: the_category_head(...)
           - pattern: previous_post(...)
           - pattern: next_post(...)
+          # WP 7.0.0 deprecated functions (WPCS 3.4.0 update)
+          - pattern: addslashes_gpc(...)
+          - pattern: block_core_navigation_block_contains_core_navigation(...)
+          - pattern: wp_sanitize_script_attributes(...)
     metadata:
       category: security
       cwe: "CWE-477"
