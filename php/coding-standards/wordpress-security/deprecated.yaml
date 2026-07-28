@@ -77,7 +77,6 @@ rules:
     patterns:
       - pattern-either:
           - pattern: get_currentuserinfo()
-          - pattern: get_user_by_email(...)
           - pattern: get_userdatabylogin(...)
           - pattern: get_user_by_email(...)
           - pattern: wp_get_single_post(...)

@@ -45,3 +45,4 @@ rules:
         - https://github.com/WordPress/WordPress-Coding-Standards/blob/develop/WordPress/Sniffs/PHP/NoSilencedErrorsSniff.php
       source: WordPress-Coding-Standards
       license: MIT
+      notes: "Defense-in-depth: WPCS still allows @unserialize() but suppressing errors on deserialization hides return-value failures that are critical for security."
