@@ -1,2 +1,3 @@
-.DS_Store
-.semgrepignore
+# Runtime state and cache
+.wp_cve_state.json
+.scan_cache/
