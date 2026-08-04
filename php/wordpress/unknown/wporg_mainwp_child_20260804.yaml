@@ -1,0 +1,18 @@
+rules:
+  - id: codevigilant.php.wordpress.unknown.cve.wporg_mainwp_child_20260804
+    patterns:
+      - pattern: $FUNC(...)
+    message: "Vulnerability in mainwp-child (WPORG-MAINWP-CHILD-20260804): unknown"
+    languages: [php]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-0"
+      owasp: "A03:2021"
+      technology: [wordpress]
+      confidence: LOW
+      source: nvd-cve-analysis
+      cve: "WPORG-MAINWP-CHILD-20260804"
+      plugin: "mainwp-child"
+      references:
+        - "https://wordpress.org/plugins/mainwp-child/"
+      license: MIT

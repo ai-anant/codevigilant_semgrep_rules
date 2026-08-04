@@ -1,0 +1,18 @@
+rules:
+  - id: codevigilant.php.wordpress.unknown.cve.cve_2026_14924
+    patterns:
+      - pattern: $FUNC(...)
+    message: "Vulnerability in table (CVE-2026-14924): unknown"
+    languages: [php]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-0"
+      owasp: "A03:2021"
+      technology: [wordpress]
+      confidence: LOW
+      source: nvd-cve-analysis
+      cve: "CVE-2026-14924"
+      plugin: "table"
+      references:
+        - "https://nvd.nist.gov/vuln/detail/CVE-2026-14924"
+      license: MIT
