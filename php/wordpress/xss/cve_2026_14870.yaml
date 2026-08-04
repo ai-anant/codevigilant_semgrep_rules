@@ -1,0 +1,18 @@
+rules:
+  - id: codevigilant.php.wordpress.xss.cve.cve_2026_14870
+    patterns:
+      - pattern: - pattern-regex: echo[\s\S]*?\$_GET|echo[\s\S]*?\$_POST|echo[\s\S]*?\$_REQUEST
+    message: "Potential XSS in forms (CVE-2026-14870): unescaped user input in echo"
+    languages: [php]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-79"
+      owasp: "A03:2021"
+      technology: [wordpress]
+      confidence: LOW
+      source: nvd-cve-analysis
+      cve: "CVE-2026-14870"
+      plugin: "forms"
+      references:
+        - "https://nvd.nist.gov/vuln/detail/CVE-2026-14870"
+      license: MIT
