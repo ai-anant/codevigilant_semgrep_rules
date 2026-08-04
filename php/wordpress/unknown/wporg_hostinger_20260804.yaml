@@ -1,0 +1,19 @@
+rules:
+  - id: codevigilant.php.wordpress.unknown.cve.wporg_hostinger_20260804
+    patterns:
+      - pattern: eval(...)
+    - 
+    message: "Potential vulnerability in hostinger (WPORG-HOSTINGER-20260804): unknown"
+    languages: [php]
+    severity: WARNING
+    metadata:
+      cwe: "CWE-0"
+      owasp: "A03:2021"
+      technology: [wordpress]
+      confidence: LOW
+      source: nvd-cve-analysis
+      cve: "WPORG-HOSTINGER-20260804"
+      plugin: "hostinger"
+      references:
+        - "https://wordpress.org/plugins/hostinger/"
+      license: MIT
