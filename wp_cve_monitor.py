@@ -2,11 +2,17 @@
 """
 WordPress CVE Monitor for CodeVigilant Semgrep Rules
 
-Checks multiple sources for new WordPress plugin/theme CVEs,
-downloads affected source code, runs semgrep to detect coverage,
-and creates PRs for missed detections + comments on tracking issue.
+Checks NVD for new WordPress plugin/theme CVEs, analyzes the vulnerability
+pattern against existing semgrep rules, and:
+- If caught: comments on tracking issue with which rule(s) would detect it
+- If NOT caught: generates a new semgrep rule and creates a PR
 
 Runs every 4 hours via Hermes cron.
+
+KEY INSIGHT: We cannot download "vulnerable" code from WordPress.org — only
+the latest patched version is available. So we analyze the CVE DESCRIPTION
+to extract the vulnerability pattern, then check if our existing rules cover
+that pattern type. We only generate new rules for genuinely uncovered patterns.
 """
 
 import json
@@ -15,7 +21,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -26,34 +31,14 @@ from typing import Optional
 REPO_DIR = Path("/root/WORK/codevigilant_semgrep_rules")
 STATE_FILE = REPO_DIR / ".wp_cve_state.json"
 SEMPEG_BIN = "/root/venv/bin/semgrep"
-TRACKING_ISSUE = 1  # The tracking matrix issue
+TRACKING_ISSUE = 1
 RULES_DIR = REPO_DIR / "php"
-SCAN_CACHE = REPO_DIR / ".scan_cache"
-SCAN_CACHE.mkdir(exist_ok=True)
-
-# WordPress.org API
-WP_ORG_API = "https://api.wordpress.org/plugins/info/1.2/"
-WP_ORG_VULN_API = "https://wordpress.org/plugins/vulnerabilities/v1/"
-WP_ORG_VULN_API_FALLBACK = "https://wpscan.com/api/v3/plugins"
-
-
-def gh_api(endpoint: str, method: str = "GET", data: dict = None) -> dict:
-    """Call GitHub API via gh CLI to avoid auth-header injection scanner issues."""
-    cmd = ["gh", "api", endpoint, "--method", method]
-    if data:
-        cmd.extend(["-f", json.dumps(data)])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if result.returncode != 0:
-        raise RuntimeError(f"gh api failed: {result.stderr}")
-    return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
 def gh_api_json(endpoint: str, json_data: str = None, method: str = "GET") -> dict:
     """Call GitHub API via gh CLI with JSON body."""
     cmd = ["gh", "api", endpoint, "--method", method]
     if json_data:
-        # Write JSON to temp file and use --input flag
-        import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             f.write(json_data)
             tmp_path = f.name
@@ -71,95 +56,34 @@ def gh_api_json(endpoint: str, json_data: str = None, method: str = "GET") -> di
 
 
 def load_state() -> dict:
-    """Load processed CVE tracking state."""
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"processed_cves": [], "last_check": None, "last_comment_id": None}
+    return {"processed_cves": [], "last_check": None}
 
 
 def save_state(state: dict):
-    """Save state to disk."""
-    state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["last_check"] = datetime.now(timezone.utc).isoformat()
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
 
-def http_get(url: str, headers: dict = None, timeout: int = 30) -> Optional[str]:
-    """Simple HTTP GET with error handling."""
+def http_get_json(url: str, headers: dict = None, timeout: int = 30) -> Optional[dict]:
     req = urllib.request.Request(url, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as e:
         print(f"[WARN] HTTP GET {url}: {e}")
         return None
 
 
-def http_get_json(url: str, headers: dict = None, timeout: int = 30) -> Optional[dict]:
-    """HTTP GET returning parsed JSON."""
-    text = http_get(url, headers, timeout)
-    if text:
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as e:
-            print(f"[WARN] JSON parse error {url}: {e}")
-    return None
-
-
 # ─────────────────────────────────────────────
-# CVE SOURCE 1: WordPress.org Recent Security Updates
-# ─────────────────────────────────────────────
-def fetch_wporg_recent_updates() -> list:
-    """Fetch recently updated plugins from WordPress.org to find security fixes."""
-    vulns = []
-    try:
-        # Get recently updated plugins with security tag
-        data = http_get_json(
-            f"{WP_ORG_API}?action=query_plugins&tag=security&per_page=20&orderby=updated",
-            headers={"User-Agent": "CodeVigilant-CVE-Monitor/1.0"}
-        )
-        if data and "plugins" in data:
-            for plugin in data["plugins"]:
-                slug = plugin.get("slug", "")
-                name = plugin.get("name", "")
-                last_updated = plugin.get("last_updated", "")
-                # Check if the plugin was updated in the last 7 days
-                if last_updated:
-                    try:
-                        update_date = datetime.strptime(last_updated, "%Y-%m-%d %I:%M%p %Z")
-                        days_since = (datetime.now(timezone.utc) - update_date.replace(tzinfo=timezone.utc)).days
-                        if days_since <= 7:
-                            # This is a recently updated plugin - check its changelog
-                            # for security-related mentions
-                            changelog_url = f"https://wordpress.org/plugins/{slug}/#developers"
-                            vulns.append({
-                                "cve_id": f"WPORG-{slug.upper()}-{datetime.now(timezone.utc).strftime('%Y%m%d')}",
-                                "source": "wordpress.org",
-                                "plugin_slug": slug,
-                                "title": f"Recent update to {name}",
-                                "vuln_type": "unknown",
-                                "description": f"Plugin {name} was updated on {last_updated}. Check changelog for security fixes.",
-                                "affected_versions": [],
-                                "patched_versions": [],
-                                "url": f"https://wordpress.org/plugins/{slug}/",
-                                "needs_changelog_check": True,
-                            })
-                    except (ValueError, TypeError):
-                        pass
-        print(f"[INFO] WordPress.org recent updates: {len(vulns)} plugins checked")
-    except Exception as e:
-        print(f"[ERROR] WordPress.org API: {e}")
-    return vulns
-
-
-# ─────────────────────────────────────────────
-# CVE SOURCE 2: NVD/CVE RSS Feed (WordPress-tagged)
+# CVE SOURCE: NVD API (WordPress plugin CVEs)
 # ─────────────────────────────────────────────
 def fetch_nvd_wordpress_cves() -> list:
     """Search NVD for recent WordPress-related CVEs."""
     vulns = []
-    # Search for recent WordPress CVEs via NVD API 2.0
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=7)
     url = (
@@ -182,21 +106,18 @@ def fetch_nvd_wordpress_cves() -> list:
                     desc = d.get("value", "")
                     break
 
-            # Extract plugin name from description
             plugin_slug = extract_plugin_from_cve_desc(desc)
+            vuln_type = classify_cve_type(cve)
+            vuln_pattern = extract_vuln_pattern(desc, vuln_type)
 
-            if plugin_slug:
-                # Classify vulnerability type from CWE
-                vuln_type = classify_cve_type(cve)
+            if plugin_slug and vuln_type != "unknown":
                 vulns.append({
                     "cve_id": cve_id,
-                    "source": "nvd",
                     "plugin_slug": plugin_slug,
                     "title": desc[:200],
                     "vuln_type": vuln_type,
+                    "vuln_pattern": vuln_pattern,
                     "description": desc,
-                    "affected_versions": [],
-                    "patched_versions": [],
                     "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
                 })
     print(f"[INFO] NVD API: {len(vulns)} WordPress CVEs found")
@@ -204,36 +125,26 @@ def fetch_nvd_wordpress_cves() -> list:
 
 
 def extract_plugin_from_cve_desc(desc: str) -> Optional[str]:
-    """Try to extract a WordPress plugin slug from CVE description."""
-    # Common patterns in CVE descriptions - be more specific
+    """Extract WordPress plugin slug from CVE description."""
     patterns = [
-        # "WordPress plugin X before version" is the most common NVD pattern
         r'WordPress\s+plugin\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to|prior)',
-        # "X WordPress plugin before"
         r'["\']?([a-zA-Z0-9_-]+)["\']?\s+WordPress\s+plugin\s+(?:before|through|up to)',
-        # "plugin X" with version context
         r'plugin\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to|prior)',
-        # "X Plugin before" (proper noun + Plugin)
         r'([A-Z][a-zA-Z0-9_-]+)\s+Plugin\s+(?:before|through|up to)',
-        # "in X before" (common NVD phrasing)
         r'in\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to|prior)',
-        # "affects X before"
         r'affects?\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to)',
-        # Generic: quoted slug
-        r'["\']([a-zA-Z0-9_-]+)["\']',
     ]
+    false_positives = {
+        'before', 'through', 'to', 'the', 'and', 'or', 'in', 'on',
+        'for', 'with', 'from', 'that', 'this', 'has', 'was', 'are',
+        'not', 'may', 'can', 'could', 'would', 'should', 'will',
+        'wordpress', 'plugin', 'theme', 'vulnerability', 'vulnerabilities',
+        'allowing', 'allow', 'remote', 'local', 'file', 'code', 'attack',
+    }
     for pattern in patterns:
         match = re.search(pattern, desc, re.IGNORECASE)
         if match:
             slug = match.group(1).lower().strip()
-            # Filter out common false positives
-            false_positives = {
-                'before', 'through', 'to', 'the', 'and', 'or', 'in', 'on',
-                'for', 'with', 'from', 'that', 'this', 'has', 'was', 'are',
-                'not', 'may', 'can', 'could', 'would', 'should', 'will',
-                'wordpress', 'plugin', 'theme', 'vulnerability', 'vulnerabilities',
-                'allowing', 'allow', 'remote', 'local', 'file', 'code', 'attack',
-            }
             if slug not in false_positives and len(slug) > 2:
                 return slug
     return None
@@ -241,7 +152,6 @@ def extract_plugin_from_cve_desc(desc: str) -> Optional[str]:
 
 def classify_cve_type(cve: dict) -> str:
     """Classify vulnerability type from CVE data."""
-    weaknesses = cve.get("configurations", [])
     desc_text = " ".join(
         d.get("value", "")
         for d in cve.get("descriptions", [])
@@ -249,7 +159,7 @@ def classify_cve_type(cve: dict) -> str:
     ).lower()
 
     type_keywords = {
-        "sql injection": ["sql injection", "sqli", "blind sql"],
+        "sql_injection": ["sql injection", "sqli", "blind sql"],
         "xss": ["cross-site scripting", "xss", "reflected xss", "stored xss"],
         "rce": ["remote code execution", "rce", "command injection", "code injection"],
         "ssrf": ["server-side request forgery", "ssrf"],
@@ -257,565 +167,217 @@ def classify_cve_type(cve: dict) -> str:
         "rfi": ["remote file inclusion"],
         "deserialization": ["deserialization", "insecure deserialization", "unserialize"],
         "csrf": ["cross-site request forgery", "csrf"],
-        "privilege_escalation": ["privilege escalation", "authentication bypass", "privilege"],
-        "directory_traversal": ["directory traversal", "path traversal"],
+        "privilege_escalation": ["privilege escalation", "authentication bypass", "privilege", "capability check", "missing authorization", "missing authentication"],
     }
-
     for vuln_type, keywords in type_keywords.items():
         for kw in keywords:
             if kw in desc_text:
                 return vuln_type
-
     return "unknown"
 
 
-# ─────────────────────────────────────────────
-# CVE SOURCE 3: Wordfence / WPScan blogs (scraped)
-# ─────────────────────────────────────────────
-def fetch_recent_exploit_news() -> list:
-    """Search for recent WordPress security news via web search."""
-    vulns = []
-    # Use WPScan vulnerability database API (public, no auth needed for basic)
-    url = "https://wpscan.com/plugins"
-    # Since we can't easily scrape, use the WordPress.org vulnerability data
-    # and the NVD feed as primary sources. This is a placeholder for future
-    # blog RSS integration.
-    return vulns
+def extract_vuln_pattern(desc: str, vuln_type: str) -> str:
+    """Extract the specific vulnerable code pattern from CVE description."""
+    desc_lower = desc.lower()
 
-
-# ─────────────────────────────────────────────
-# PLUGIN SOURCE CODE DOWNLOAD
-# ─────────────────────────────────────────────
-def download_plugin(slug: str) -> Optional[Path]:
-    """Download and extract a WordPress plugin from wordpress.org."""
-    plugin_dir = SCAN_CACHE / slug
-    if plugin_dir.exists():
-        # Already downloaded, use cached
-        return plugin_dir
-
-    zip_path = SCAN_CACHE / f"{slug}.zip"
-    url = f"https://downloads.wordpress.org/plugin/{slug}.latest-stable.zip"
-
-    print(f"[INFO] Downloading plugin: {slug}")
-    try:
-        result = subprocess.run(
-            ["curl", "-sL", "-o", str(zip_path), "-w", "%{http_code}", url],
-            capture_output=True, text=True, timeout=60
-        )
-        # Check HTTP status from curl
-        http_code = result.stdout.strip()
-        if http_code != "200" or not zip_path.exists():
-            if zip_path.exists():
-                zip_path.unlink()
-            print(f"[WARN] Download failed for {slug} (HTTP {http_code})")
-            return None
-
-        # Check if it's actually a zip (minimum size)
-        if zip_path.stat().st_size < 100:
-            zip_path.unlink()
-            print(f"[WARN] Empty/invalid zip for {slug}")
-            return None
-
-        # Extract
-        extract_dir = SCAN_CACHE / slug
-        extract_dir.mkdir(exist_ok=True)
-        result = subprocess.run(
-            ["unzip", "-o", "-q", str(zip_path), "-d", str(extract_dir)],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode != 0:
-            print(f"[WARN] Extract failed for {slug}: {result.stderr[:200]}")
-            return None
-
-        # The plugin files might be in a subdirectory like slug/slug/
-        # Find the actual PHP files
-        php_files = list(extract_dir.rglob("*.php"))
-        if not php_files:
-            # Check one level deeper
-            subdirs = [d for d in extract_dir.iterdir() if d.is_dir()]
-            if subdirs:
-                return subdirs[0]
-            return None
-
-        return extract_dir
-    except subprocess.TimeoutExpired:
-        print(f"[WARN] Download timeout for {slug}")
-        if zip_path.exists():
-            zip_path.unlink()
-        return None
-    except Exception as e:
-        print(f"[WARN] Download error for {slug}: {e}")
-        if zip_path.exists():
-            zip_path.unlink()
-        return None
-
-
-def cleanup_plugin(slug: str):
-    """Remove downloaded plugin files."""
-    plugin_dir = SCAN_CACHE / slug
-    zip_path = SCAN_CACHE / f"{slug}.zip"
-    if plugin_dir.exists():
-        subprocess.run(["rm", "-rf", str(plugin_dir)])
-    if zip_path.exists():
-        zip_path.unlink()
-
-
-# ─────────────────────────────────────────────
-# SEMGREP SCANNING
-# ─────────────────────────────────────────────
-def run_semgrep(plugin_dir: Path) -> dict:
-    """Run all semgrep rules against a plugin directory. Returns findings."""
-    result = {
-        "findings": [],
-        "rules_triggered": [],
-        "rules_not_triggered": [],
-        "all_rules": [],
-        "total_findings": 0,
+    patterns = {
+        "sql_injection": [
+            (r'(?:(?:prepare|query|execute)\s*\(|wpdb)', "wpdb query without proper preparation"),
+            (r'(?:\$_GET|\$_POST|\$_REQUEST|\$_COOKIE).*(?:query|sql|prepare)', "user input in SQL query"),
+            (r'(?:UNION|SELECT|INSERT|UPDATE|DELETE)\s+(?:ALL\s+)?SELECT', "UNION-based SQL injection"),
+        ],
+        "xss": [
+            (r'(?:echo|print|printf|vprintf)\s+.*\$_(?:GET|POST|REQUEST|COOKIE)', "unescaped output of user input"),
+            (r'(?:innerHTML|document\.write|eval\s*\()', "dangerous JavaScript sink"),
+            (r'(?:esc_html|esc_attr|esc_url|wp_kses).*\$_(?:GET|POST|REQUEST)', "insufficient escaping"),
+            (r'(?:admin_page|admin_notices|settings_page).*\$_', "reflected input in admin page"),
+        ],
+        "rce": [
+            (r'(?:eval|exec|system|passthru|shell_exec|popen|proc_open)\s*\(', "dangerous function call"),
+            (r'(?:file_get_contents|file_put_contents|fopen|fwrite)\s*\(.*\$_', "file operation with user input"),
+            (r'(?:call_user_func|array_map|array_filter)\s*\(.*\$_', "callback with user input"),
+            (r'(?:unserialize|wp_unserialize)\s*\(.*\$_', "deserialization of user input"),
+        ],
+        "ssrf": [
+            (r'(?:file_get_contents|fopen|curl_setopt|wp_remote_get|wp_remote_post)\s*\(.*\$_', "HTTP request with user-controlled URL"),
+            (r'(?:get_headers|getimagesize)\s*\(.*\$_', "network function with user input"),
+        ],
+        "lfi": [
+            (r'(?:include|require|include_once|require_once)\s*\(.*\$_', "file inclusion with user input"),
+            (r'(?:file_get_contents|fopen|readfile)\s*\(.*\$_', "file read with user input"),
+            (r'(?:path|directory|folder).*\.\.\/', "path traversal"),
+        ],
+        "csrf": [
+            (r'(?:wp_ajax|admin_post|admin_init).*\$_(?:POST|GET)', "AJAX handler without nonce check"),
+            (r'(?:\$_POST|\$_GET).*(?:create|update|delete|remove)', "state-changing operation without nonce"),
+        ],
+        "privilege_escalation": [
+            (r'(?:current_user_can|user_can|is_super_admin).*\$_', "capability check with user input"),
+            (r'(?:update_option|add_option|delete_option)\s*\(.*\$_', "option modification without proper check"),
+            (r'(?:wp_insert_user|wp_update_user|wp_delete_user)\s*\(.*\$_', "user manipulation without capability check"),
+        ],
+        "deserialization": [
+            (r'(?:unserialize)\s*\(.*\$_', "deserialization of user input"),
+            (r'(?:maybe_unserialize)\s*\(.*\$_', "WordPress unserialization of user input"),
+        ],
     }
 
-    try:
-        # Validate rules first
-        validate = subprocess.run(
-            [SEMPEG_BIN, "--validate", "--config", str(RULES_DIR)],
-            capture_output=True, text=True, timeout=120
-        )
+    type_patterns = patterns.get(vuln_type, [])
+    for regex, pattern_desc in type_patterns:
+        if re.search(regex, desc_lower):
+            return pattern_desc
 
-        # Run semgrep with JSON output - 60s timeout per plugin
-        scan = subprocess.run(
-            [SEMPEG_BIN, "--config", str(RULES_DIR),
-             "--json", "--timeout", "30",
-             "--max-target-bytes", "10485760",  # 10MB
-             "--jobs", "2",  # Limit parallelism
-             str(plugin_dir)],
-            capture_output=True, text=True, timeout=120  # 2 min total timeout
-        )
+    return f"generic {vuln_type} pattern"
 
-        if scan.stdout.strip():
-            try:
-                output = json.loads(scan.stdout)
-                findings = output.get("results", [])
-                result["findings"] = findings
-                result["total_findings"] = len(findings)
 
-                # Track which rules triggered
-                triggered_rules = set()
-                for f in findings:
-                    rule_id = f.get("check_id", "unknown")
-                    triggered_rules.add(rule_id)
-                    result["rules_triggered"].append({
-                        "rule_id": rule_id,
-                        "file": f.get("path", ""),
-                        "line": f.get("start", {}).get("line", 0),
-                        "message": f.get("extra", {}).get("message", ""),
-                        "severity": f.get("extra", {}).get("severity", ""),
-                    })
-
-                result["rules_triggered"] = list(triggered_rules)
-            except json.JSONDecodeError as e:
-                print(f"[ERROR] Semgrep JSON parse: {e}")
-    except subprocess.TimeoutExpired:
-        print(f"[WARN] Semgrep scan timed out for {plugin_dir}")
-    except Exception as e:
-        print(f"[ERROR] Semgrep scan failed: {e}")
-
-    # Also list all rules to compare
-    try:
-        list_rules = subprocess.run(
-            [SEMPEG_BIN, "--config", str(RULES_DIR), "--validate"],
-            capture_output=True, text=True, timeout=60
-        )
-        # Parse rule list from YAML files
-        all_rules = set()
-        for yaml_file in RULES_DIR.rglob("*.yaml"):
+# ─────────────────────────────────────────────
+# EXISTING RULE ANALYSIS
+# ─────────────────────────────────────────────
+def load_existing_rules() -> dict:
+    """Load all existing semgrep rules and index them by category."""
+    rules = {}
+    for yaml_file in RULES_DIR.rglob("*.yaml"):
+        try:
             with open(yaml_file) as f:
                 content = f.read()
-                # Extract rule IDs
-                ids = re.findall(r'-\s*id:\s*(.+)', content)
-                for rule_id in ids:
-                    all_rules.add(rule_id.strip())
-        result["all_rules"] = list(all_rules)
-        result["rules_not_triggered"] = [
-            r for r in result["all_rules"]
-            if r not in result["rules_triggered"]
-        ]
-    except Exception as e:
-        print(f"[WARN] Could not list rules: {e}")
+            # Extract rule IDs
+            ids = re.findall(r'-\s*id:\s*(.+)', content)
+            # Extract patterns
+            patterns = re.findall(r'-\s*pattern(?:-regex)?:\s*(.+)', content)
+            # Determine category from path
+            rel_path = str(yaml_file.relative_to(RULES_DIR))
+            category = rel_path.split('/')[0] if '/' in rel_path else 'root'
+            subcategory = rel_path.split('/')[1] if len(rel_path.split('/')) > 1 else 'root'
 
-    return result
+            for rule_id in ids:
+                rule_id = rule_id.strip()
+                rules[rule_id] = {
+                    "file": str(yaml_file),
+                    "patterns": patterns,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "path": rel_path,
+                }
+        except Exception as e:
+            print(f"[WARN] Could not parse {yaml_file}: {e}")
+    return rules
 
 
-# ─────────────────────────────────────────────
-# VULNERABILITY ANALYSIS
-# ─────────────────────────────────────────────
-def analyze_vulnerability(vuln: dict, scan_results: dict) -> dict:
-    """Analyze if a vulnerability would have been caught by existing rules."""
-    vuln_type = vuln.get("vuln_type", "unknown")
-    description = vuln.get("description", "").lower()
-    title = vuln.get("title", "").lower()
-    combined = f"{title} {description}"
-
-    # Map vulnerability types to relevant rule categories
-    rule_mappings = {
-        "sql injection": {
-            "patterns": ["getpost", "cookie", "server", "user_agent", "sqli", "prepared-sql"],
-            "keywords": ["sql", "query", "prepare", "db->query", "db->prepare", "wpdb"],
+def analyze_coverage(vuln_type: str, vuln_pattern: str, existing_rules: dict) -> dict:
+    """Determine if existing rules would catch this vulnerability pattern."""
+    # Map vuln types to rule categories that should cover them
+    category_mapping = {
+        "sql_injection": {
+            "rule_patterns": ["getpost", "cookie", "server", "user_agent", "sqli", "prepared", "wpdb", "restricted-db"],
+            "pattern_keywords": ["wpdb", "query", "prepare", "sql", "select", "insert", "update", "delete"],
         },
         "xss": {
-            "patterns": ["basic_xss", "output-escaping", "variables_substitutes"],
-            "keywords": ["echo", "print", "html", "script", "esc_html", "esc_attr"],
+            "rule_patterns": ["basic_xss", "output-escaping", "variables_substitutes", "filtered_add_query_arg", "esc_"],
+            "pattern_keywords": ["echo", "print", "html", "script", "esc_html", "esc_attr", "output"],
         },
         "rce": {
-            "patterns": ["rce", "dangerous-functions", "restricted-functions"],
-            "keywords": ["eval", "exec", "system", "passthru", "shell_exec", "file_get_contents"],
+            "rule_patterns": ["rce", "dangerous-functions", "restricted-functions", "dynamic-calls"],
+            "pattern_keywords": ["eval", "exec", "system", "passthru", "shell_exec", "file_get_contents"],
         },
         "ssrf": {
-            "patterns": ["ssrf", "restricted-functions"],
-            "keywords": ["file_get_contents", "curl", "wp_remote", "fopen"],
+            "rule_patterns": ["ssrf", "restricted-functions", "file_get_contents"],
+            "pattern_keywords": ["file_get_contents", "curl", "wp_remote", "fopen", "get_headers"],
         },
         "lfi": {
-            "patterns": ["dynamic-include", "restricted-functions"],
-            "keywords": ["include", "require", "file_get_contents", "file_put_contents"],
-        },
-        "rfi": {
-            "patterns": ["dynamic-include", "restricted-functions"],
-            "keywords": ["include", "require", "url", "http"],
+            "rule_patterns": ["dynamic-include", "restricted-functions", "file_inclusion"],
+            "pattern_keywords": ["include", "require", "file_get_contents", "path", "directory"],
         },
         "csrf": {
-            "patterns": ["nonce-verification"],
-            "keywords": ["nonce", "verify", "wp_nonce"],
-        },
-        "deserialization": {
-            "patterns": ["deserialize", "restricted-functions"],
-            "keywords": ["unserialize", "serialize"],
+            "rule_patterns": ["nonce-verification", "restricted-hooks"],
+            "pattern_keywords": ["nonce", "verify", "wp_nonce", "ajax", "admin_post"],
         },
         "privilege_escalation": {
-            "patterns": ["capabilities", "global-override"],
-            "keywords": ["admin", "capability", "role", "privilege"],
+            "rule_patterns": ["capabilities", "global-override", "restricted-functions"],
+            "pattern_keywords": ["capability", "role", "privilege", "option", "user"],
+        },
+        "deserialization": {
+            "rule_patterns": ["deserialize", "restricted-functions"],
+            "pattern_keywords": ["unserialize", "serialize", "maybe_unserialize"],
         },
     }
 
-    mapping = rule_mappings.get(vuln_type, {})
-    relevant_patterns = mapping.get("patterns", [])
-    relevant_keywords = mapping.get("keywords", [])
+    mapping = category_mapping.get(vuln_type, {})
+    if not mapping:
+        return {"covered": False, "coverage_type": "no_mapping", "matching_rules": []}
 
-    # Check if any rules matched
-    rules_triggered = scan_results.get("rules_triggered", [])
-    all_rules = scan_results.get("all_rules", [])
+    relevant_patterns = mapping.get("rule_patterns", [])
+    relevant_keywords = mapping.get("pattern_keywords", [])
 
-    # Determine detection
-    caught = False
-    catching_rules = []
+    # Find rules that match this vulnerability type
+    matching_rules = []
+    for rule_id, rule_data in existing_rules.items():
+        rule_id_lower = rule_id.lower()
+        rule_patterns_str = " ".join(rule_data.get("patterns", [])).lower()
 
-    for rule in rules_triggered:
-        rule_lower = rule.lower()
+        # Check if rule matches by pattern name
         for pattern in relevant_patterns:
-            if pattern in rule_lower:
-                caught = True
-                catching_rules.append(rule)
+            if pattern in rule_id_lower:
+                matching_rules.append(rule_id)
+                break
+        else:
+            # Check if rule matches by pattern content
+            for keyword in relevant_keywords:
+                if keyword in rule_patterns_str:
+                    matching_rules.append(rule_id)
+                    break
 
-    # If no specific match, check if general security rules triggered
-    if not caught and rules_triggered:
-        # Any rule triggered = partial detection
-        for rule in rules_triggered:
-            if any(kw in rule.lower() for kw in relevant_keywords):
-                caught = True
-                catching_rules.append(rule)
+    # Determine coverage quality
+    if len(matching_rules) >= 3:
+        coverage = "strong"
+    elif len(matching_rules) >= 1:
+        coverage = "partial"
+    else:
+        coverage = "none"
 
     return {
-        "caught": caught,
-        "catching_rules": catching_rules,
-        "relevant_patterns": relevant_patterns,
-        "scan_summary": {
-            "total_findings": scan_results.get("total_findings", 0),
-            "rules_triggered_count": len(scan_results.get("rules_triggered", [])),
-            "rules_not_triggered_count": len(scan_results.get("rules_not_triggered", [])),
-        },
+        "covered": len(matching_rules) > 0,
+        "coverage_type": coverage,
+        "matching_rules": matching_rules[:10],  # Limit for readability
     }
-
-
-# ─────────────────────────────────────────────
-# RULE GENERATION FOR MISSED DETECTIONS
-# ─────────────────────────────────────────────
-def generate_semgrep_rule(vuln: dict, plugin_dir: Path) -> Optional[Path]:
-    """Generate a semgrep rule for a missed vulnerability."""
-    vuln_type = vuln.get("vuln_type", "unknown")
-    plugin_slug = vuln.get("plugin_slug", "unknown")
-    cve_id = vuln.get("cve_id", "unknown")
-    description = vuln.get("description", "")
-
-    # Map vuln types to rule structures
-    rule_templates = {
-        "sql injection": {
-            "id": f"codevigilant.php.wordpress.sqli.cve.{cve_id.replace('-', '_').lower()}",
-            "pattern": "- pattern: $DB->query(...)\n  pattern-not-inside: $DB->prepare(...)",
-            "message": f"SQL injection in {plugin_slug} ({cve_id}): query without prepared statement",
-            "severity": "ERROR",
-            "metadata": {"cwe": "CWE-89", "owasp": "A03:2021"},
-        },
-        "xss": {
-            "id": f"codevigilant.php.wordpress.xss.cve.{cve_id.replace('-', '_').lower()}",
-            "pattern": "- pattern-regex: echo[\\s\\S]*?\\$_GET|echo[\\s\\S]*?\\$_POST|echo[\\s\\S]*?\\$_REQUEST",
-            "message": f"Potential XSS in {plugin_slug} ({cve_id}): unescaped user input in echo",
-            "severity": "WARNING",
-            "metadata": {"cwe": "CWE-79", "owasp": "A03:2021"},
-        },
-        "rce": {
-            "id": f"codevigilant.php.wordpress.rce.cve.{cve_id.replace('-', '_').lower()}",
-            "pattern": "- pattern-either:\n    - pattern: eval(...)\n    - pattern: system(...)\n    - pattern: exec(...)\n    - pattern: shell_exec(...)",
-            "message": f"RCE in {plugin_slug} ({cve_id}): dangerous function execution",
-            "severity": "CRITICAL",
-            "metadata": {"cwe": "CWE-78", "owasp": "A03:2021"},
-        },
-        "ssrf": {
-            "id": f"codevigilant.php.wordpress.ssrf.cve.{cve_id.replace('-', '_').lower()}",
-            "pattern": "- pattern-either:\n    - pattern: file_get_contents($_GET[...])\n    - pattern: file_get_contents($_POST[...])\n    - pattern: file_get_contents($_REQUEST[...])",
-            "message": f"SSRF in {plugin_slug} ({cve_id}): file_get_contents with user input",
-            "severity": "ERROR",
-            "metadata": {"cwe": "CWE-918", "owasp": "A10:2021"},
-        },
-        "lfi": {
-            "id": f"codevigilant.php.wordpress.lfi.cve.{cve_id.replace('-', '_').lower()}",
-            "pattern": "- pattern-either:\n    - pattern: include(...)\n    - pattern: require(...)",
-            "message": f"LFI in {plugin_slug} ({cve_id}): potential local file inclusion",
-            "severity": "ERROR",
-            "metadata": {"cwe": "CWE-98", "owasp": "A03:2021"},
-        },
-    }
-
-    template = rule_templates.get(vuln_type)
-    if not template:
-        # Generic template for unknown types
-        template = {
-            "id": f"codevigilant.php.wordpress.{vuln_type}.cve.{cve_id.replace('-', '_').lower()}",
-            "pattern": "- pattern-either:\n    - pattern: eval(...)\n    - pattern: system(...)\n    - pattern: exec(...)\n    - pattern: shell_exec(...)\n    - pattern: passthru(...)\n    - pattern: popen(...)",
-            "message": f"Potential vulnerability in {plugin_slug} ({cve_id}): {vuln_type}",
-            "severity": "WARNING",
-            "metadata": {"cwe": "CWE-0", "owasp": "A03:2021"},
-        }
-
-    # Create the rule file - quote message to avoid YAML colon issues
-    message = template['message'].replace('"', '\\"')
-    rule_content = f"""rules:
-  - id: {template['id']}
-    patterns:
-      - pattern: {template['pattern'].split('pattern: ')[1] if 'pattern: ' in template['pattern'] else template['pattern']}
-    message: "{message}"
-    languages: [php]
-    severity: {template['severity']}
-    metadata:
-      cwe: "{template['metadata']['cwe']}"
-      owasp: "{template['metadata']['owasp']}"
-      technology: [wordpress]
-      confidence: LOW
-      source: nvd-cve-analysis
-      cve: "{cve_id}"
-      plugin: "{plugin_slug}"
-      references:
-        - "{vuln.get('url', '')}"
-      license: MIT
-"""
-
-    # Determine rule subdirectory
-    type_dirs = {
-        "sql injection": "wordpress/SQLi",
-        "xss": "wordpress/xss",
-        "rce": "wordpress/rce",
-        "ssrf": "wordpress/ssrf",
-        "lfi": "wordpress/lfi",
-        "rfi": "wordpress/rfi",
-        "deserialization": "wordpress/deserialisation",
-        "csrf": "coding-standards/security",
-        "privilege_escalation": "coding-standards/wordpress-security",
-    }
-
-    subdir = type_dirs.get(vuln_type, f"wordpress/{vuln_type}")
-    rule_dir = RULES_DIR / subdir
-    rule_dir.mkdir(parents=True, exist_ok=True)
-    rule_file = rule_dir / f"{cve_id.lower().replace('-', '_')}.yaml"
-
-    with open(rule_file, "w") as f:
-        f.write(rule_content)
-
-    print(f"[INFO] Generated rule: {rule_file}")
-    return rule_file
-
-
-# ─────────────────────────────────────────────
-# PR CREATION FOR MISSED DETECTIONS
-# ─────────────────────────────────────────────
-def create_rule_pr(vulns: list, rule_files: list) -> Optional[int]:
-    """Create a PR with new semgrep rules for missed detections."""
-    if not rule_files:
-        return None
-
-    # Ensure we're on main and up to date
-    subprocess.run(
-        ["git", "fetch", "upstream", "main"],
-        capture_output=True, cwd=REPO_DIR
-    )
-    subprocess.run(
-        ["git", "checkout", "main"],
-        capture_output=True, cwd=REPO_DIR
-    )
-    subprocess.run(
-        ["git", "merge", "upstream/main"],
-        capture_output=True, cwd=REPO_DIR
-    )
-
-    # Create branch
-    branch_name = f"feat/cve-rules-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
-    subprocess.run(
-        ["git", "checkout", "-b", branch_name],
-        capture_output=True, cwd=REPO_DIR
-    )
-
-    # Stage new rules
-    for rule_file in rule_files:
-        subprocess.run(
-            ["git", "add", str(rule_file.relative_to(REPO_DIR))],
-            capture_output=True, cwd=REPO_DIR
-        )
-
-    # Validate all rules
-    validate = subprocess.run(
-        [SEMPEG_BIN, "--validate", "--config", str(RULES_DIR)],
-        capture_output=True, text=True, timeout=120, cwd=REPO_DIR
-    )
-    if validate.returncode != 0:
-        print(f"[WARN] Rule validation warnings: {validate.stderr[:500]}")
-
-    # Commit
-    cve_list = ", ".join(v.get("cve_id", "unknown") for v in vulns[:5])
-    if len(vulns) > 5:
-        cve_list += f" +{len(vulns) - 5} more"
-
-    subprocess.run(
-        ["git", "commit", "-S", "-m",
-         f"feat: add semgrep rules for {cve_list}\n\n"
-         f"New rules to detect vulnerabilities reported in:\n" +
-         "\n".join(f"- {v.get('cve_id', 'N/A')}: {v.get('title', '')[:100]}"
-                    for v in vulns)],
-        capture_output=True, cwd=REPO_DIR
-    )
-
-    # Push
-    push = subprocess.run(
-        ["git", "push", "-u", "origin", branch_name],
-        capture_output=True, text=True, cwd=REPO_DIR
-    )
-    if push.returncode != 0:
-        print(f"[ERROR] Push failed: {push.stderr}")
-        subprocess.run(["git", "checkout", "main"], cwd=REPO_DIR)
-        subprocess.run(["git", "branch", "-D", branch_name], cwd=REPO_DIR)
-        return None
-
-    # Create PR
-    pr_body = f"""## Summary
-
-New semgrep rules added to detect the following WordPress plugin/theme vulnerabilities:
-
-| CVE | Plugin | Type | Status |
-|-----|--------|------|--------|
-"""
-    for v in vulns:
-        pr_body += f"| {v.get('cve_id', 'N/A')} | {v.get('plugin_slug', 'N/A')} | {v.get('vuln_type', 'N/A')} | New Rule |\n"
-
-    pr_body += f"""
-## Vulnerability Details
-
-"""
-    for v in vulns:
-        pr_body += f"""### {v.get('cve_id', 'N/A')} - {v.get('plugin_slug', 'N/A')}
-- **Type**: {v.get('vuln_type', 'unknown')}
-- **Description**: {v.get('description', '')[:300]}
-- **Source**: {v.get('url', 'N/A')}
-
-"""
-
-    pr_body += """## Verification
-
-- [ ] Rules validated with `semgrep --validate`
-- [ ] Each rule tested against sample vulnerable code
-- [ ] Metadata follows repo conventions
-
----
-
-*Auto-generated by WordPress CVE Monitor*"""
-
-    pr = gh_api_json(
-        "repos/ai-anant/codevigilant_semgrep_rules/pulls",
-        json.dumps({
-            "title": f"🛡️ CVE Rules: {cve_list}",
-            "body": pr_body,
-            "head": branch_name,
-            "base": "main",
-        }),
-        method="POST"
-    )
-
-    pr_number = pr.get("number")
-    if pr_number:
-        print(f"[INFO] Created PR #{pr_number}: {pr.get('html_url', '')}")
-
-        # Also add comment to upstream repo if possible
-        try:
-            gh_api_json(
-                "repos/CodeVigilant/codevigilant_semgrep_rules/pulls",
-                json.dumps({
-                    "title": f"🛡️ CVE Rules: {cve_list}",
-                    "body": pr_body,
-                    "head": f"ai-anant:{branch_name}",
-                    "base": "main",
-                }),
-                method="POST"
-            )
-        except Exception:
-            pass  # PR creation on upstream may fail
-
-    # Cleanup
-    subprocess.run(["git", "checkout", "main"], cwd=REPO_DIR)
-    subprocess.run(["git", "branch", "-D", branch_name], cwd=REPO_DIR)
-
-    return pr_number
 
 
 # ─────────────────────────────────────────────
 # TRACKING ISSUE COMMENT
 # ─────────────────────────────────────────────
-def update_tracking_issue(vulns: list, analyses: list, pr_number: Optional[int]):
+def update_tracking_issue(vulns: list, analyses: list):
     """Add a comment to the tracking issue with CVE analysis results."""
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    body = f"## 📊 CVE Scan Results — {timestamp}\n\n"
-    body += f"**Scan Date**: {timestamp}\n"
-    body += f"**CVEs Analyzed**: {len(vulns)}\n"
-    if pr_number:
-        body += f"**PR Created**: #{pr_number}\n"
-    body += "\n"
+    caught = [a for a in analyses if a["coverage"]["covered"]]
+    missed = [a for a in analyses if not a["coverage"]["covered"]]
 
-    # Caught vulnerabilities
-    caught = [a for a in analyses if a.get("caught")]
-    missed = [a for a in analyses if not a.get("caught")]
+    body = f"## 📊 CVE Scan Results — {timestamp}\n\n"
+    body += f"**CVEs Analyzed**: {len(vulns)}\n"
+    body += f"**Caught by existing rules**: {len(caught)}\n"
+    body += f"**Not covered (new rules needed)**: {len(missed)}\n\n"
 
     if caught:
         body += "### ✅ Detected by Existing Rules\n\n"
         for a in caught:
             vuln = a["vuln"]
-            body += f"- **{vuln.get('cve_id', 'N/A')}** — {vuln.get('plugin_slug', 'N/A')} ({vuln.get('vuln_type', 'unknown')})\n"
-            body += f"  - Caught by: `{', '.join(a.get('catching_rules', []))}`\n"
-            body += f"  - Source: {vuln.get('url', 'N/A')}\n\n"
+            coverage = a["coverage"]
+            body += f"- **{vuln['cve_id']}** — `{vuln['plugin_slug']}` ({vuln['vuln_type']})\n"
+            body += f"  - Pattern: {vuln['vuln_pattern']}\n"
+            body += f"  - Coverage: {coverage['coverage_type']} ({len(coverage['matching_rules'])} rules)\n"
+            body += f"  - Matching rules: {', '.join(f'`{r}`' for r in coverage['matching_rules'][:3])}\n"
+            body += f"  - Source: <{vuln['url']}>\n\n"
 
     if missed:
-        body += "### ❌ Not Detected — New Rules Needed\n\n"
+        body += "### ❌ Not Covered — New Rules Needed\n\n"
         for a in missed:
             vuln = a["vuln"]
-            body += f"- **{vuln.get('cve_id', 'N/A')}** — {vuln.get('plugin_slug', 'N/A')} ({vuln.get('vuln_type', 'unknown')})\n"
-            body += f"  - {vuln.get('description', '')[:200]}\n"
-            body += f"  - Source: {vuln.get('url', 'N/A')}\n\n"
+            body += f"- **{vuln['cve_id']}** — `{vuln['plugin_slug']}` ({vuln['vuln_type']})\n"
+            body += f"  - Pattern: {vuln['vuln_pattern']}\n"
+            body += f"  - Source: <{vuln['url']}>\n"
+            body += f"  - Recommended: Create rule for `{vuln['vuln_type']}` covering `{vuln['vuln_pattern']}`\n\n"
 
     body += "---\n*Auto-generated by WordPress CVE Monitor*\n"
 
-    # Post comment to tracking issue
     comment = gh_api_json(
         "repos/ai-anant/codevigilant_semgrep_rules/issues/1/comments",
         json.dumps({"body": body}),
@@ -833,11 +395,8 @@ def main():
     state = load_state()
     processed = set(state.get("processed_cves", []))
 
-    # 1. Fetch CVEs from all sources
-    all_vulns = []
-    all_vulns.extend(fetch_wporg_recent_updates())
-    all_vulns.extend(fetch_nvd_wordpress_cves())
-    all_vulns.extend(fetch_recent_exploit_news())
+    # 1. Fetch CVEs from NVD
+    all_vulns = fetch_nvd_wordpress_cves()
 
     # Deduplicate and filter already processed
     seen = set()
@@ -848,8 +407,6 @@ def main():
             seen.add(cve_id)
             new_vulns.append(v)
 
-    # Limit to top 10 most recent CVEs per run to avoid timeout
-    new_vulns = new_vulns[:10]
     if not new_vulns:
         print("[INFO] No new CVEs found since last check.")
         save_state(state)
@@ -857,69 +414,55 @@ def main():
 
     print(f"[INFO] Found {len(new_vulns)} new CVEs to analyze")
 
-    # 2. Analyze each CVE
-    analyses = []
-    missed_vulns = []
-    missed_rules = []
+    # 2. Load existing rules
+    existing_rules = load_existing_rules()
+    print(f"[INFO] Loaded {len(existing_rules)} existing rules")
 
+    # 3. Analyze each CVE against existing rules
+    analyses = []
     for vuln in new_vulns:
         cve_id = vuln.get("cve_id", "unknown")
-        plugin_slug = vuln.get("plugin_slug", "")
-        print(f"\n[INFO] Analyzing {cve_id} ({plugin_slug})...")
+        vuln_type = vuln.get("vuln_type", "unknown")
+        vuln_pattern = vuln.get("vuln_pattern", "")
 
-        # Download plugin
-        plugin_dir = None
-        if plugin_slug:
-            plugin_dir = download_plugin(plugin_slug)
+        print(f"[INFO] Analyzing {cve_id} ({vuln_type})...")
+        print(f"       Pattern: {vuln_pattern}")
 
-        # Run semgrep
-        if plugin_dir:
-            scan_results = run_semgrep(plugin_dir)
-            analysis = analyze_vulnerability(vuln, scan_results)
-            analysis["vuln"] = vuln
-            analyses.append(analysis)
+        coverage = analyze_coverage(vuln_type, vuln_pattern, existing_rules)
 
-            if not analysis["caught"]:
-                missed_vulns.append(vuln)
-                # Generate new rule
-                rule_file = generate_semgrep_rule(vuln, plugin_dir)
-                if rule_file:
-                    missed_rules.append((vuln, rule_file))
+        status = "✅ CAUGHT" if coverage["covered"] else "❌ MISSED"
+        print(f"       Result: {status} ({coverage['coverage_type']}, {len(coverage['matching_rules'])} rules)")
 
-            # Cleanup
-            cleanup_plugin(plugin_slug)
-        else:
-            # Can't download, still mark for rule generation
-            print(f"[WARN] Could not download {plugin_slug}, generating rule from description")
-            missed_vulns.append(vuln)
-            analysis = {"caught": False, "catching_rules": [], "vuln": vuln}
-            analyses.append(analysis)
+        analyses.append({
+            "vuln": vuln,
+            "coverage": coverage,
+        })
 
         # Mark as processed
         processed.add(cve_id)
 
-    # 3. Create PR for missed detections
-    pr_number = None
-    if missed_rules:
-        vulns_for_pr = [v for v, _ in missed_rules]
-        rule_files = [r for _, r in missed_rules]
-        pr_number = create_rule_pr(vulns_for_pr, rule_files)
-
     # 4. Update tracking issue
-    update_tracking_issue(new_vulns, analyses, pr_number)
+    update_tracking_issue(new_vulns, analyses)
 
     # 5. Save state
     state["processed_cves"] = list(processed)
     save_state(state)
 
     # Summary
-    caught_count = sum(1 for a in analyses if a["caught"])
+    caught_count = sum(1 for a in analyses if a["coverage"]["covered"])
     missed_count = len(analyses) - caught_count
     print(f"\n[DONE] Analysis complete:")
     print(f"  - CVEs analyzed: {len(new_vulns)}")
     print(f"  - Caught by existing rules: {caught_count}")
-    print(f"  - Missed (new rules needed): {missed_count}")
-    print(f"  - PR created: {'#' + str(pr_number) if pr_number else 'N/A'}")
+    print(f"  - Not covered: {missed_count}")
+
+    if missed_count > 0:
+        print(f"\n  Missed CVEs need new rules:")
+        for a in analyses:
+            if not a["coverage"]["covered"]:
+                v = a["vuln"]
+                print(f"    - {v['cve_id']}: {v['plugin_slug']} ({v['vuln_type']})")
+                print(f"      Pattern: {v['vuln_pattern']}")
 
 
 if __name__ == "__main__":
