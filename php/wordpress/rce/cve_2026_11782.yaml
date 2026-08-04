@@ -1,0 +1,19 @@
+rules:
+  - id: codevigilant.php.wordpress.rce.cve.cve_2026_11782
+    patterns:
+      - pattern: eval(...)
+    - 
+    message: RCE in woocommerce (CVE-2026-11782): dangerous function execution
+    languages: [php]
+    severity: CRITICAL
+    metadata:
+      cwe: CWE-78
+      owasp: A03:2021
+      technology: [wordpress]
+      confidence: LOW
+      source: nvd-cve-analysis
+      cve: CVE-2026-11782
+      plugin: woocommerce
+      references:
+        - https://nvd.nist.gov/vuln/detail/CVE-2026-11782
+      license: MIT
