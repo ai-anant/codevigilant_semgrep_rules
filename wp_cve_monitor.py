@@ -127,6 +127,8 @@ def fetch_nvd_wordpress_cves() -> list:
 def extract_plugin_from_cve_desc(desc: str) -> Optional[str]:
     """Extract WordPress plugin slug from CVE description."""
     patterns = [
+        # Multi-word names: "The Ultimate Member WordPress plugin before 2.12.1"
+        r'(?:The\s+)?([A-Z][A-Za-z0-9]+(?:\s+[A-Za-z0-9]+){1,4})\s+WordPress\s+plugin\s+(?:before|through|up to|prior)',
         r'WordPress\s+plugin\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to|prior)',
         r'["\']?([a-zA-Z0-9_-]+)["\']?\s+WordPress\s+plugin\s+(?:before|through|up to)',
         r'plugin\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to|prior)',
@@ -145,6 +147,11 @@ def extract_plugin_from_cve_desc(desc: str) -> Optional[str]:
         match = re.search(pattern, desc, re.IGNORECASE)
         if match:
             slug = match.group(1).lower().strip()
+            # Normalize multi-word names to kebab-case (e.g. "Ultimate Member" -> "ultimate-member")
+            slug = re.sub(r'\s+', '-', slug)
+            # Drop a captured leading article ("The GiveWP" -> "givewp")
+            if slug.startswith('the-') and len(slug) > 5:
+                slug = slug[4:]
             if slug not in false_positives and len(slug) > 2:
                 return slug
     return None
@@ -160,14 +167,30 @@ def classify_cve_type(cve: dict) -> str:
 
     type_keywords = {
         "sql_injection": ["sql injection", "sqli", "blind sql"],
-        "xss": ["cross-site scripting", "xss", "reflected xss", "stored xss"],
+        "xss": ["cross-site scripting", "xss", "reflected xss", "stored xss",
+                "does not sanitise", "does not sanitize", "does not escape",
+                "store javascript", "javascript that runs", "unfiltered_html"],
         "rce": ["remote code execution", "rce", "command injection", "code injection"],
         "ssrf": ["server-side request forgery", "ssrf"],
         "lfi": ["local file inclusion", "path traversal", "directory traversal"],
         "rfi": ["remote file inclusion"],
         "deserialization": ["deserialization", "insecure deserialization", "unserialize"],
-        "csrf": ["cross-site request forgery", "csrf"],
-        "privilege_escalation": ["privilege escalation", "authentication bypass", "privilege", "capability check", "missing authorization", "missing authentication"],
+        "csrf": ["cross-site request forgery", "csrf", "nonce check", "nonce checks",
+                 "capability or nonce", "nonce"],
+        "privilege_escalation": ["privilege escalation", "authentication bypass",
+                                 "privilege", "capability check", "missing authorization",
+                                 "missing authentication", "capabilit", "elevat",
+                                 "administrator-level"],
+        "idor": ["broken access control", "does not verify that", "does not restrict access",
+                 "does not properly restrict", "does not verify", "does not restrict",
+                 "belongs to the requesting user", "authorized to modify",
+                 "access control", "does not check that"],
+        "information_disclosure": ["information disclosure", "publicly accessible",
+                                   "predictable filename", "predictable location",
+                                   "backup archives", "export files",
+                                   "without access protection", "does not protect"],
+        "auth_bypass": ["one-time password", "otp", "does not validate the submitted",
+                        "stored secret", "authentication bypass"],
     }
     for vuln_type, keywords in type_keywords.items():
         for kw in keywords:
@@ -219,6 +242,18 @@ def extract_vuln_pattern(desc: str, vuln_type: str) -> str:
         "deserialization": [
             (r'(?:unserialize)\s*\(.*\$_', "deserialization of user input"),
             (r'(?:maybe_unserialize)\s*\(.*\$_', "WordPress unserialization of user input"),
+        ],
+        "idor": [
+            (r'(?:does not (?:verify|check|restrict|properly restrict))', "missing ownership/authorization verification"),
+            (r'(?:belongs to the requesting user|authorized to modify)', "missing object-level authorization"),
+        ],
+        "information_disclosure": [
+            (r'(?:publicly accessible|predictable filename|predictable location)', "sensitive files in predictable/public location"),
+            (r'(?:backup archives|export files)', "sensitive backup/export file exposure"),
+        ],
+        "auth_bypass": [
+            (r'(?:one-time password|stored secret|otp)', "weak/incorrect OTP verification"),
+            (r'(?:does not validate)', "missing credential validation"),
         ],
     }
 
@@ -298,6 +333,18 @@ def analyze_coverage(vuln_type: str, vuln_pattern: str, existing_rules: dict) ->
         "deserialization": {
             "rule_patterns": ["deserialize", "restricted-functions"],
             "pattern_keywords": ["unserialize", "serialize", "maybe_unserialize"],
+        },
+        "idor": {
+            "rule_patterns": ["capabilities", "nonce-verification", "restricted-hooks", "authorization"],
+            "pattern_keywords": ["nonce", "capability", "current_user_can", "authorization", "permission"],
+        },
+        "information_disclosure": {
+            "rule_patterns": ["restricted-functions", "file", "directory", "path"],
+            "pattern_keywords": ["file_get_contents", "fopen", "backup", "export", "readfile"],
+        },
+        "auth_bypass": {
+            "rule_patterns": ["capabilities", "nonce-verification", "restricted-hooks", "authentication"],
+            "pattern_keywords": ["nonce", "capability", "auth", "current_user_can", "login"],
         },
     }
 
