@@ -86,17 +86,27 @@ def fetch_nvd_wordpress_cves() -> list:
     vulns = []
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=7)
-    url = (
-        f"https://services.nvd.nist.gov/rest/json/cves/2.0"
-        f"?keywordSearch=wordpress+plugin"
-        f"&keywordExactMatch"
-        f"&pubStartDate={start_date.strftime('%Y-%m-%dT00:00:00.000')}"
-        f"&pubEndDate={end_date.strftime('%Y-%m-%dT23:59:59.999')}"
-        f"&resultsPerPage=20"
-    )
-    data = http_get_json(url, timeout=60)
-    if data and "vulnerabilities" in data:
-        for v in data["vulnerabilities"]:
+    start_index = 0
+    per_page = 2000
+    total = None
+    fetched = 0
+    while True:
+        url = (
+            f"https://services.nvd.nist.gov/rest/json/cves/2.0"
+            f"?keywordSearch=wordpress+plugin"
+            f"&keywordExactMatch"
+            f"&pubStartDate={start_date.strftime('%Y-%m-%dT00:00:00.000')}"
+            f"&pubEndDate={end_date.strftime('%Y-%m-%dT23:59:59.999')}"
+            f"&resultsPerPage={per_page}&startIndex={start_index}"
+        )
+        data = http_get_json(url, timeout=60)
+        if not data or "vulnerabilities" not in data:
+            print("[WARN] NVD fetch failed at startIndex", start_index)
+            break
+        total = data.get("totalResults", 0)
+        batch = data.get("vulnerabilities", [])
+        fetched += len(batch)
+        for v in batch:
             cve = v.get("cve", {})
             cve_id = cve.get("id", "")
             descriptions = cve.get("descriptions", [])
@@ -120,6 +130,9 @@ def fetch_nvd_wordpress_cves() -> list:
                     "description": desc,
                     "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
                 })
+        if fetched >= total or not batch:
+            break
+        start_index += len(batch)
     print(f"[INFO] NVD API: {len(vulns)} WordPress CVEs found")
     return vulns
 
