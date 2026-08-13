@@ -1,0 +1,60 @@
+rules:
+  # ============================================================================
+  # PLUGIN FILE SELF-DEFINES ABSPATH (DIRECT ACCESS ENABLED)
+  # Generic CodeVigilant rule.
+  # ============================================================================
+  #
+  # WordPress plugin entry files must guard against direct access with:
+  #     if ( ! defined( 'ABSPATH' ) ) { exit; }
+  # A file that instead *defines* ABSPATH when it is not loaded yet
+  #     if ( ! defined( 'ABSPATH' ) ) { define( 'ABSPATH', ... ); }
+  # turns itself into a standalone script that executes when requested
+  # directly, bypassing WordPress bootstrapping. Such files commonly process
+  # request input (query strings, POST bodies, headers) with no
+  # authentication, capability or nonce checks because they assumed WP's
+  # auth layer would gate them. This turns the file into an unauthenticated
+  # request handler (CWE-306), an open proxy/relay, or an unguarded state
+  # changer. Never define ABSPATH in plugin code; exit when it is absent.
+  #
+  # CWE-306: Missing Authentication for Critical Function
+
+  - id: codevigilant.php.wordpress.auth.direct_access.self_defined_abspath
+    severity: ERROR
+    languages: [php]
+    mode: search
+    patterns:
+      - pattern-inside: |
+          if (!defined('ABSPATH')) {
+              ...
+          }
+      - pattern-either:
+          - pattern: |
+              define('ABSPATH', $PATH);
+          - pattern: |
+              define('ABSPATH', $PATH);
+              ...
+      - pattern-not: |
+          if (!defined('ABSPATH')) {
+              exit;
+          }
+    message: |
+      This file defines the ABSPATH constant itself when WordPress has not
+      been loaded instead of exiting. The file can therefore be executed by
+      requesting it directly, bypassing WordPress authentication, nonce and
+      capability layers. Any request input it processes (query string, POST
+      body, headers) is then handled unauthenticated (CWE-306) - a common
+      source of open proxies, unguarded relays and direct-access state
+      changes. Replace the define() with an exit (the standard
+      'if ( ! defined( ABSPATH ) ) { exit; }' guard) and route any request
+      processing through WordPress.
+    metadata:
+      category: security
+      cwe: "CWE-306: Missing Authentication for Critical Function"
+      owasp: "A01:2021 - Broken Access Control"
+      technology: wordpress
+      confidence: MEDIUM
+      references:
+        - https://developer.wordpress.org/apis/security/security-best-practices/
+        - https://developer.wordpress.org/plugins/security/
+      source: CodeVigilant
+      license: MIT
