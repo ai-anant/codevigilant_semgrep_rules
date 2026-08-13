@@ -336,7 +336,7 @@ def analyze_coverage(vuln_type: str, vuln_pattern: str, existing_rules: dict) ->
             "pattern_keywords": ["include", "require", "file_get_contents", "path", "directory"],
         },
         "csrf": {
-            "rule_patterns": ["nonce-verification", "restricted-hooks"],
+            "rule_patterns": ["csrf", "nonce-verification", "restricted-hooks"],
             "pattern_keywords": ["nonce", "verify", "wp_nonce", "ajax", "admin_post"],
         },
         "privilege_escalation": {
