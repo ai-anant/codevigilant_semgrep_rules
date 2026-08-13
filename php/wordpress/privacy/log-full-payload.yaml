@@ -1,0 +1,64 @@
+rules:
+  # ============================================================================
+  # FULL REQUEST / RESPONSE / EVENT PAYLOAD LOGGED IN CONTEXT ARRAY
+  # Generic CodeVigilant rule.
+  # ============================================================================
+  #
+  # Flags logger calls whose context array contains a whole request, response,
+  # event or body payload under a well-known key ('request', 'response',
+  # 'event', 'body', 'payload'). Such payloads routinely carry PII (customer
+  # names, e-mail addresses, phone numbers, postal addresses) and, for payment
+  # integrations, payment-method details (card brand, last4, expiry). Once the
+  # payload lands in a log file it is stored at rest in plaintext, may be
+  # shipped to third-party log aggregation services, and can be read by anyone
+  # with access to the log store (backups, support staff, a later file-read
+  # bug) - an unnecessary expansion of the data's exposure surface.
+  #
+  # Excluded: values already passed through a redaction/masking helper
+  # (redact_*, mask_*). Review remaining hits: prefer logging only the fields
+  # actually needed, or redact PII before writing.
+  #
+  # CWE-532: Insertion of Sensitive Information into Log File
+
+  - id: codevigilant.php.wordpress.privacy.log_full_payload
+    severity: WARNING
+    languages: [php]
+    mode: search
+    patterns:
+      - pattern-either:
+          - pattern: $LOG->$LEVEL($MSG, [ ..., 'request' => $PAYLOAD, ... ]);
+          - pattern: $LOG->$LEVEL($MSG, [ ..., 'response' => $PAYLOAD, ... ]);
+          - pattern: $LOG->$LEVEL($MSG, [ ..., 'event' => $PAYLOAD, ... ]);
+          - pattern: $LOG->$LEVEL($MSG, [ ..., 'body' => $PAYLOAD, ... ]);
+          - pattern: $LOG->$LEVEL($MSG, [ ..., 'payload' => $PAYLOAD, ... ]);
+          - pattern: $LOG->$LEVEL($MSG, [ ..., 'data' => $PAYLOAD, ... ]);
+          - pattern: $LOG::$LEVEL($MSG, [ ..., 'request' => $PAYLOAD, ... ]);
+          - pattern: $LOG::$LEVEL($MSG, [ ..., 'response' => $PAYLOAD, ... ]);
+          - pattern: $LOG::$LEVEL($MSG, [ ..., 'event' => $PAYLOAD, ... ]);
+          - pattern: $LOG::$LEVEL($MSG, [ ..., 'body' => $PAYLOAD, ... ]);
+          - pattern: $LOG::$LEVEL($MSG, [ ..., 'payload' => $PAYLOAD, ... ]);
+          - pattern: $LOG::$LEVEL($MSG, [ ..., 'data' => $PAYLOAD, ... ]);
+      # --- exclude values already passed through redaction/masking helpers ---
+      - pattern-not: $LOG->$LEVEL($MSG, [ ..., $K => redact_sensitive_data(...), ... ]);
+      - pattern-not: $LOG->$LEVEL($MSG, [ ..., $K => redact_string(...), ... ]);
+      - pattern-not: $LOG::$LEVEL($MSG, [ ..., $K => redact_sensitive_data(...), ... ]);
+      - pattern-not: $LOG::$LEVEL($MSG, [ ..., $K => redact_string(...), ... ]);
+    message: |
+      Logger call writes a full request/response/event/body payload into the log
+      context. These payloads commonly contain PII (names, e-mails, addresses)
+      and may include payment-method details, which are then stored at rest in
+      plaintext log files and forwarded to any configured log handlers. Log only
+      the specific fields needed, or pass the payload through a redaction/masking
+      helper before logging (CWE-532).
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
+      owasp: "A09:2021 - Security Logging and Monitoring Failures"
+      technology: wordpress
+      confidence: MEDIUM
+      references:
+        - https://owasp.org/Top10/A09_2021-Security_Logging_and_Monitoring_Failures/
+        - https://developer.wordpress.org/plugins/privacy/
+        - https://developer.woocommerce.com/docs/best-practices/logging/
+      source: CodeVigilant
+      license: MIT
