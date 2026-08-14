@@ -1,0 +1,26 @@
+rules:
+  - id: codevigilant.java.jenkins.ssrf.url.taint
+    patterns:
+      - pattern: new HttpPost($URL)
+      - pattern-not: new HttpPost("...")
+    message: |
+      Detected an HttpClient POST request created from a non-literal URL.
+      When the URL is derived from configuration, environment variables or
+      other user-influenced input (for example build parameters expanded at
+      runtime), the Jenkins controller can be made to send requests to
+      internal services (SSRF). Validate the URL at the point of use: restrict
+      the scheme to http/https and check the host against an allow-list, do
+      not rely on UI-only form validation.
+    metadata:
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 - Server-Side Request Forgery (SSRF)"
+      technology: jenkins
+      confidence: MEDIUM
+      references:
+        - https://www.jenkins.io/doc/developer/security/
+      source: independent security review
+      license: MIT
+    languages: [java]
+    mode: search
+    severity: HIGH
