@@ -1,0 +1,39 @@
+rules:
+  - id: codevigilant.java.jenkins.ssl.insecure-trust-manager
+    message: >-
+      An anonymous X509TrustManager is instantiated inside a TrustManager[]
+      array (typically passed to SSLContext.init(...)) whose
+      checkServerTrusted/checkClientTrusted implementations do not delegate to
+      a real TrustManagerFactory. Such a trust manager accepts any server
+      certificate, disabling certificate validation and enabling
+      man-in-the-middle attacks against every connection built with this
+      context (credentials and secrets can be intercepted). Build the trust
+      manager from a KeyStore/TrustManagerFactory instead, or validate the
+      certificate chain explicitly.
+    severity: HIGH
+    languages: [java]
+    patterns:
+      - pattern: |
+          new TrustManager[] { new X509TrustManager() { ... } }
+      - pattern-not: |
+          new TrustManager[] { new X509TrustManager() {
+            ...
+            public void checkServerTrusted(X509Certificate[] $CERTS, String $AUTH) {
+              $MANAGER.checkServerTrusted($CERTS, $AUTH);
+            }
+            ...
+          } }
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+      owasp: "A02:2021 - Cryptographic Failures"
+      technology:
+        - jenkins
+        - java
+        - ssl
+      confidence: MEDIUM
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Transport_Layer_Protection_Cheat_Sheet.html
+        - https://docs.oracle.com/javase/8/docs/technotes/guides/security/jsse/JSSERefGuide.html
+      source: ai-anant
+      license: MIT
