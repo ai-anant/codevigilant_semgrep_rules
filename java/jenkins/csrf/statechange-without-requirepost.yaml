@@ -1,0 +1,42 @@
+rules:
+  - id: codevigilant.java.jenkins.csrf.statechange-without-requirepost
+    patterns:
+      - pattern-inside: |
+          public $RET $HANDLER(...) {
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $HANDLER
+          regex: ^do[A-Z]
+      - pattern-either:
+          - pattern: $OBJ.scheduleBuild2($DELAY, $CAUSE, $ACTIONS);
+          - pattern: $OBJ.scheduleBuild($DELAY);
+          - pattern: $OBJ.schedule2($DELAY);
+          - pattern: $EXEC.interrupt($RESULT);
+          - pattern: $QUEUE.setSorter($SORTER);
+      - pattern-not-inside: |
+          @RequirePOST
+          public $RET $HANDLER(...) {
+            ...
+          }
+    message: |
+      Detected a Stapler 'do*' handler that mutates Jenkins state (build
+      scheduling, executor interruption, queue sorter replacement) without the
+      @RequirePOST annotation. Stapler routes unannotated 'do*' methods for
+      both GET and POST, and the CSRF crumb is only enforced on POST requests,
+      so a cross-site GET (e.g. an <img> tag pointing at the handler URL) can
+      trigger the state change with the victim's credentials. Annotate the
+      handler with @RequirePOST so it rejects GET and requires a valid crumb.
+    metadata:
+      category: security
+      cwe: "CWE-352: Cross-Site Request Forgery"
+      owasp: "A01:2021 - Broken Access Control"
+      technology: jenkins
+      confidence: MEDIUM
+      references:
+        - https://www.jenkins.io/doc/developer/security/csrf-protection/
+      source: independent security review
+      license: MIT
+    languages: [java]
+    mode: search
+    severity: HIGH
