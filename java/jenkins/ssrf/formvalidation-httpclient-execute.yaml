@@ -1,0 +1,46 @@
+rules:
+  - id: codevigilant.java.jenkins.ssrf.formvalidation-httpclient-execute
+    patterns:
+      - pattern-inside: |
+          public FormValidation $HANDLER(...) {
+            ...
+          }
+      - pattern-either:
+          - pattern: $CLIENT.execute($REQUEST);
+          - pattern: $CLIENT.execute($REQUEST)
+      - pattern-not-inside: |
+          public FormValidation $HANDLER(...) {
+            ...
+            $Y.checkPermission($PERM);
+            ...
+          }
+    message: |
+      Detected a Stapler form-validation / test-connection handler (a method
+      returning hudson.util.FormValidation, typically named doCheck* or
+      doTestConnection) that performs an outbound HTTP request via an Apache
+      HttpClient execute(...) call without any permission check. These
+      handlers run on the Jenkins controller and are reachable by any user
+      who can access the descriptor URL (including anonymous users on
+      instances with anonymous read access); when the request URL derives
+      from stored credentials, configuration or request parameters, an
+      attacker can make the controller send credentialed requests to
+      attacker-chosen hosts and observe reachability/status-code feedback -
+      a server-side request forgery oracle from the controller into the
+      internal network (CWE-918) combined with missing authorization
+      (CWE-862). Add @RequirePOST/@POST, an explicit permission check
+      (e.g. Jenkins.get().checkPermission(Jenkins.ADMINISTER)), validate the
+      target URL scheme/host against an allow-list and add timeouts.
+    metadata:
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 - Server-Side Request Forgery"
+      technology: jenkins
+      confidence: MEDIUM
+      references:
+        - https://www.jenkins.io/doc/developer/security/#server-side-request-forgery-ssrf
+        - https://owasp.org/www-community/attacks/Server_Side_Request_Forgery
+      source: independent security review
+      license: MIT
+    languages: [java]
+    mode: search
+    severity: HIGH
