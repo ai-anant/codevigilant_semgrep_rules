@@ -1,0 +1,44 @@
+rules:
+  # ============================================================================
+  # UNCONTAINED RELATIVE PATH INTO hudson.util.FilePath (CWE-22 Path Traversal)
+  # Generic shape: a FilePath is built as new FilePath(base, rel) where `rel`
+  # is supplied by an attacker-influenced value (config, build parameter,
+  # workspace file content, API/SCM data) and then read/written/child()'d.
+  # If `rel` is not confined to `base` (no containment/rel-path-prefix check,
+  # e.g. absent getChild-based sandboxing, no `.isUnder()`/prefix validation),
+  # a value like "../../etc/passwd" escapes the workspace and reads/writes
+  # arbitrary paths on the agent under the Jenkins user.
+  # ============================================================================
+
+  - id: codevigilant.java.jenkins.path-traversal.uncontained-filepath-rel
+    message: >-
+      FilePath is constructed as new FilePath(base, rel) where `rel` derives
+      from an attacker-influenced (non-literal) value and there is no clear
+      containment check confining `rel` under `base`. A value such as
+      '../../etc/passwd' escapes the workspace and lets the code read, write,
+      or delete arbitrary paths on the agent under the Jenkins service user
+      (CWE-22). Validate that the resolved filename is constrained to the
+      intended base directory before use (e.g. normalize + verify it is
+      contained within the base path via a containment check).
+    severity: ERROR
+    languages: [java]
+    patterns:
+      - pattern-either:
+          - pattern: new FilePath($BASE, $REL)
+          - pattern: $FP = new FilePath($BASE, $REL)
+      - metavariable-regex:
+          metavariable: $REL
+          regex: '(?![ ]*"[^"]*")[A-Za-z_][A-Za-z0-9_.A-Za-z0-9()]*(\$)?[A-Za-z0-9_$.()]*'
+      - pattern-not: new FilePath($BASE, "...")
+      - pattern-not: $FP = new FilePath($BASE, "...")
+    metadata:
+      category: security
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp: "A01:2021 - Broken Access Control"
+      technology: jenkins
+      confidence: MEDIUM
+      references:
+        - https://cwe.mitre.org/data/definitions/22.html
+        - https://www.jenkins.io/doc/developer/security/access-control/sandbox/
+      source: semgrep-rule-gap
+      license: MIT
