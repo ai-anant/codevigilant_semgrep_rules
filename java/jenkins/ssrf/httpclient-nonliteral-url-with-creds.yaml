@@ -5,17 +5,20 @@ rules:
   # Generic shape: an Apache HttpClient (HttpClients.custom()) attaches a
   # UsernamePasswordCredentials via BasicCredentialsProvider to an outbound
   # HttpGet/HttpPost whose URL is derived from a non-literal/config-driven
-  # value. If the URL is attacker/influenceable, the request can be redirected
-  # to an arbitrary host which then receives the embedded credentials.
+  # value; or a Jersey client attaches its credentials via setCredentials() to
+  # a WebResource built with Client.resource(non-literal-url). If the URL is
+  # attacker/influenceable, the request can be redirected to an arbitrary host
+  # which then receives the embedded credentials.
   # ============================================================================
 
   - id: codevigilant.java.jenkins.ssrf.httpclient-nonliteral-url-with-creds
     message: >-
-      An outbound Apache HttpClient sends a request to a URL derived from a
-      non-literal (config/build-parameter influenced) value while a credentials
-      provider (UsernamePasswordCredentials / BasicCredentialsProvider) is
-      attached to the request context. If an attacker can influence the URL,
-      this becomes SSRF where the request (and the embedded credentials and any
+      An outbound HTTP client sends a request to a URL derived from a
+      non-literal (config/build-parameter influenced) value while credentials
+      are attached to the request context (an Apache HttpClient
+      UsernamePasswordCredentials / BasicCredentialsProvider, or a Jersey
+      client's setCredentials()). If an attacker can influence the URL, this
+      becomes SSRF where the request (and the embedded credentials and any
       payload) is delivered to an attacker-controlled host (CWE-918 / CWE-522).
       Validate that the target URL is pinned to a trusted, literal endpoint and
       never attacker-influenceable.
@@ -25,8 +28,10 @@ rules:
       - pattern-either:
           - pattern: new HttpGet($URL)
           - pattern: new HttpPost($URL)
+          - pattern: $CLIENT.resource($URL)
       - pattern-not: new HttpGet("...")
       - pattern-not: new HttpPost("...")
+      - pattern-not: $CLIENT.resource("...")
     metadata:
       category: security
       cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
