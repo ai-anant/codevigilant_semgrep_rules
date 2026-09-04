@@ -5,18 +5,24 @@ rules:
   #  Generation of Code)
   # Generic shape: a Jenkins build step builds a process command vector whose
   # executable path (and/or tokens) are resolved from a FilePath inside the
-  # build workspace (`workspace.child(...)` / `FilePath.child(...)`), and that
-  # vector is handed to `Launcher.launch().cmds(...)`. Workspace content is
-  # commonly attacker-influenceable (SCM checkout, shared agent workspaces,
-  # earlier build steps); if a step re-uses an existing file at such a path as
-  # the process binary without verifying it is genuine, this yields arbitrary
-  # code execution in the build and potential credential exposure.
+  # build workspace — either via `workspace.child(...)` / `FilePath.child(...)`
+  # or by STRING-CONCATENATING the workspace path value (e.g.
+  # `$WS + "/binary"`, `$WS + "/" + $NAME`; FilePath.toString() yields the
+  # remote path string so the concat resolves to the workspace on the agent) —
+  # and that vector is handed to `Launcher.launch().cmds(...)` /
+  # `ArgumentListBuilder`. Workspace content is commonly attacker-influenceable
+  # (SCM checkout, shared agent workspaces, earlier build steps); if a step
+  # re-uses an existing file at such a path as the process binary without
+  # verifying it is genuine (e.g. the binary was supposed to be downloaded from
+  # a URL but the download failed silently), this yields arbitrary code
+  # execution in the build and potential credential exposure.
   # ============================================================================
   - id: codevigilant.java.jenkins.rce.workspace-child-launch-direct
     mode: taint
     message: >-
       A process is launched with a command vector built from a workspace-
-      resolved path (a FilePath `child(...)`). Build workspace content can be
+      resolved path (a FilePath `child(...)` result or a path string built by
+      concatenating the workspace value). Build workspace content can be
       attacker-influenceable (SCM checkout, shared agent workspace, earlier
       build steps). Executing a workspace-resolved file without verifying its
       authenticity can allow arbitrary code execution in the build context and
@@ -27,8 +33,25 @@ rules:
     pattern-sources:
       - pattern: $WS.child($NAME).getRemote()
       - pattern: $WS.child($NAME)
+      # string-concatenated workspace path (FilePath.toString() == getRemote()):
+      - patterns:
+          - pattern-either:
+              - pattern: $WS + "/" + $NAME
+              - patterns:
+                  - pattern: $WS + $LIT
+                  - metavariable-regex:
+                      # metavariable-regex sees the quoted literal text
+                      # (e.g. "/scannercli"), so anchor on the leading quote.
+                      metavariable: $LIT
+                      regex: '^"[/\\]'
     pattern-sinks:
-      - pattern: $X.add($T)
+      # scope the add-sink to command-vector-like receivers to avoid
+      # flagging ordinary collection adds (e.g. List<String>.add)
+      - patterns:
+          - pattern: $X.add(..., $T, ...)
+          - metavariable-regex:
+              metavariable: $X
+              regex: (?i).*(arg|cmd|command|argv|launch|proc|builder|token).*
       - pattern: new ArgumentListBuilder($T)
       - pattern: $LAUNCHER.launch().cmds($ARGS)
     metadata:
