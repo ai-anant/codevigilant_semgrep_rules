@@ -1,17 +1,18 @@
 rules:
   # ============================================================================
-  # UNCONTAINED FilePath CONSTRUCTION (CWE-22) + REMOTE-PATH STRING USED FOR
-  # CONTROLLER-SIDE java.io FILE I/O (CWE-59)
+  # UNCONTAINED BASE+REL PATH CONSTRUCTION (CWE-22) + REMOTE-PATH STRING USED
+  # FOR CONTROLLER-SIDE java.io FILE I/O (CWE-59)
   # Generic shape:
-  #   (a) a FilePath is built as `new FilePath(base, rel)` where `rel` is
-  #       supplied by an attacker-influenced value (config field, build
-  #       parameter, workspace file content, API/SCM data) and is not confined
-  #       to `base` (no containment / rel-path-prefix check, e.g. absent
-  #       getChild-based sandboxing, no `.isUnder()`/prefix validation), so a
-  #       value like "/etc/passwd" or "../../etc/passwd" (FilePath returns an
-  #       absolute rel unchanged and only normalize()s relative ones) escapes
-  #       the base and reads/writes arbitrary paths on the controller/agent
-  #       under the Jenkins service user;
+  #   (a) a path is built as `new FilePath(base, rel)` OR `new File(base, rel)`
+  #       where `rel` is supplied by an attacker-influenced value (config
+  #       field, build parameter, workspace file content, API/SCM data,
+  #       request path fragment) and is not confined to `base` (no containment
+  #       / rel-path-prefix check, e.g. absent getChild-based sandboxing, no
+  #       `.isUnder()`/prefix validation), so a value like "/etc/passwd" or
+  #       "../../etc/passwd" (FilePath returns an absolute rel unchanged and
+  #       only normalize()s relative ones; java.io.File resolves "../" against
+  #       the parent) escapes the base and reads/writes arbitrary paths on the
+  #       controller/agent under the Jenkins service user;
   #   (b) the remote path STRING obtained from a FilePath (`.getRemote()` /
   #       `.getRemote()`-derived value) is handed to controller-side
   #       java.io file APIs (`new File(...)`, FileInput/OutputStream,
@@ -23,23 +24,26 @@ rules:
 
   - id: codevigilant.java.jenkins.path-traversal.uncontained-filepath-rel
     message: >-
-      FilePath is constructed as new FilePath(base, rel) where `rel` derives
-      from an attacker-influenced (non-literal) value without a containment
-      check, OR a FilePath-derived remote path string (getRemote()) is handed
-      to controller-side java.io File I/O. A value such as '/etc/passwd' or
-      '../../etc/passwd' escapes the workspace and lets the code read, write,
-      or delete arbitrary paths on the controller/agent under the Jenkins
-      service user (CWE-22/CWE-59). Validate that the resolved filename is
-      constrained to the intended base directory before use (e.g. normalize +
-      verify containment via isUnder()/prefix check, reject absolute rel), and
-      use channel-aware transfer (FilePath.read()/write()) instead of passing
-      a getRemote() path string to controller-side File I/O.
+      A path is constructed as new FilePath(base, rel) or new File(base, rel)
+      where `rel` derives from an attacker-influenced (non-literal) value
+      without a containment check, OR a FilePath-derived remote path string
+      (getRemote()) is handed to controller-side java.io File I/O. A value
+      such as '/etc/passwd' or '../../etc/passwd' escapes the workspace and
+      lets the code read, write, or delete arbitrary paths on the
+      controller/agent under the Jenkins service user (CWE-22/CWE-59).
+      Validate that the resolved filename is constrained to the intended base
+      directory before use (e.g. normalize + verify containment via
+      isUnder()/prefix check, reject absolute rel), and use channel-aware
+      transfer (FilePath.read()/write()) instead of passing a getRemote()
+      path string to controller-side File I/O.
     severity: ERROR
     languages: [java]
     patterns:
       - pattern-either:
           - pattern: new FilePath($BASE, $REL)
           - pattern: $FP = new FilePath($BASE, $REL)
+          - pattern: new File($BASE, $REL)
+          - pattern: $FILE = new File($BASE, $REL)
           - pattern: new File($Y.getRemote())
           - pattern: new FileInputStream($Y.getRemote())
           - pattern: new FileOutputStream($Y.getRemote())
@@ -50,6 +54,8 @@ rules:
           regex: '(?![ ]*\"[^\"]*\")[A-Za-z_][A-Za-z0-9_.A-Za-z0-9()]*(\$)?[A-Za-z0-9_$.()]*'
       - pattern-not: new FilePath($BASE, "...")
       - pattern-not: $FP = new FilePath($BASE, "...")
+      - pattern-not: new File($BASE, "...")
+      - pattern-not: $FILE = new File($BASE, "...")
     metadata:
       category: security
       cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
