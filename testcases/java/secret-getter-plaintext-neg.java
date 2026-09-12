@@ -16,6 +16,11 @@ public class NegGetter {
     public String getDisplayName() {
         return "Aliyun OSS Uploader";
     }
+
+    // toString() on a non-credential receiver must not fire.
+    public String getGroupId() {
+        return groupId.toString();
+    }
 }
 
 public class NegPlaintextStorage {

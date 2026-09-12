@@ -14,4 +14,9 @@ public class PosGetter {
     String getApiToken() {
         return apiToken.getPlainText();
     }
+
+    // Secret.toString() decrypts; same exposure as getPlainText().
+    public String getStagingPW() {
+        return helper.stagingPW.toString();
+    }
 }
