@@ -21,6 +21,7 @@ public class StateChangePos implements Action {
   // vulnerable: no @RequirePOST -> GET-reachable state changes
   public void doBuild(final StaplerRequest request, final StaplerResponse response) {
     project.scheduleBuild2(0, new Cause.UserIdCause(), new Action[0]);
+    Jenkins.getInstance().getQueue().schedule(project, 0, new Cause.UserIdCause());
     Executor executor = getExecutor();
     if (executor != null) {
       executor.interrupt(Result.ABORTED);

@@ -12,6 +12,8 @@ rules:
           - pattern: $OBJ.scheduleBuild2($DELAY, $CAUSE, $ACTIONS);
           - pattern: $OBJ.scheduleBuild($DELAY);
           - pattern: $OBJ.schedule2($DELAY);
+          - pattern: $QUEUE.schedule($TASK, $DELAY, $ACTION);
+          - pattern: $QUEUE.schedule($TASK, $DELAY);
           - pattern: $EXEC.interrupt($RESULT);
           - pattern: $QUEUE.setSorter($SORTER);
       - pattern-not-inside: |
@@ -21,7 +23,7 @@ rules:
           }
     message: |
       Detected a Stapler 'do*' handler that mutates Jenkins state (build
-      scheduling, executor interruption, queue sorter replacement) without the
+      scheduling including Queue.schedule, executor interruption, queue sorter replacement) without the
       @RequirePOST annotation. Stapler routes unannotated 'do*' methods for
       both GET and POST, and the CSRF crumb is only enforced on POST requests,
       so a cross-site GET (e.g. an <img> tag pointing at the handler URL) can
