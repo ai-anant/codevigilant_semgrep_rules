@@ -1,0 +1,28 @@
+rules:
+  - id: codevigilant.java.jenkins.aws.clientbuilder-defaultclient
+    message: |
+      Detected AWS SDK v1 `*ClientBuilder.defaultClient()`. That helper uses
+      DefaultAWSCredentialsProviderChain (process environment, shared config
+      files, instance/container profile) with no explicit credentials
+      provider. In Jenkins Builder/Publisher perform() this runs on the
+      controller JVM, so job configurators inherit the controller AWS
+      identity. Bind an explicit credentials-plugin credential or pass an
+      AWSCredentialsProvider; do not call defaultClient() on the controller.
+    metadata:
+      category: security
+      cwe: "CWE-269: Improper Privilege Management"
+      owasp: "A01:2021 - Broken Access Control"
+      technology: jenkins
+      confidence: HIGH
+      references:
+        - https://www.jenkins.io/doc/developer/security/
+        - https://docs.aws.amazon.com/sdk-for-java/v1/developer-guide/credentials.html
+      source: independent security review
+      license: MIT
+    languages: [java]
+    severity: ERROR
+    patterns:
+      - pattern: $BUILDER.defaultClient()
+      - metavariable-regex:
+          metavariable: $BUILDER
+          regex: .*ClientBuilder
