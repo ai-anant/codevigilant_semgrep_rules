@@ -1,13 +1,26 @@
 rules:
   - id: codevigilant.java.jenkins.aws.clientbuilder-defaultclient
     message: |
-      Detected AWS SDK v1 `*ClientBuilder.defaultClient()`. That helper uses
-      DefaultAWSCredentialsProviderChain (process environment, shared config
-      files, instance/container profile) with no explicit credentials
-      provider. In Jenkins Builder/Publisher perform() this runs on the
-      controller JVM, so job configurators inherit the controller AWS
-      identity. Bind an explicit credentials-plugin credential or pass an
-      AWSCredentialsProvider; do not call defaultClient() on the controller.
+      Detected an AWS SDK v1 `*ClientBuilder` left on the SDK default
+      credentials path instead of an explicitly bound credential:
+
+        - `defaultClient()`, which is documented to use
+          DefaultAWSCredentialsProviderChain; and
+        - `withCredentials(...)` fed directly by a credential lookup
+          (`CredentialsProvider.findCredentialById` / `lookupCredentials` /
+          an AWS credentials helper) whose result is never null-checked. When
+          that lookup returns null the builder keeps null credentials, and the
+          SDK substitutes DefaultAWSCredentialsProviderChain.
+
+      In both cases the client authenticates with the ambient identity of the
+      JVM: process environment variables, shared config files, web-identity
+      token, and container/instance profile. In a Jenkins Builder or Publisher
+      perform() (or a descriptor do* handler) that runs as the controller/node
+      identity, so anyone able to configure or trigger the job inherits an AWS
+      identity that was never selected for it, silently bypassing the intended
+      least-privilege binding. Bind an explicit credentials-plugin credential,
+      resolve it into a local variable, and fail closed when it is null before
+      building the client.
     metadata:
       category: security
       cwe: "CWE-269: Improper Privilege Management"
@@ -22,7 +35,27 @@ rules:
     languages: [java]
     severity: ERROR
     patterns:
-      - pattern: $BUILDER.defaultClient()
-      - metavariable-regex:
-          metavariable: $BUILDER
-          regex: .*ClientBuilder
+      - pattern-either:
+          - patterns:
+              - pattern: $BUILDER.defaultClient()
+              - metavariable-regex:
+                  metavariable: $BUILDER
+                  regex: .*ClientBuilder
+          - patterns:
+              - pattern-either:
+                  - pattern: $CLSB.standard().withCredentials($CRED)
+                  - patterns:
+                      - pattern-inside: |
+                          $BUILDER_DECL $BUILDER = $CLSB.standard();
+                          ...
+                      - pattern: $BUILDER.withCredentials($CRED)
+              - metavariable-regex:
+                  metavariable: $CLSB
+                  regex: (?i).*clientbuilder.*
+              - metavariable-pattern:
+                  metavariable: $CRED
+                  patterns:
+                    - pattern-either:
+                        - pattern: CredentialsProvider.findCredentialById(...)
+                        - pattern: CredentialsProvider.lookupCredentials(...)
+                        - pattern: $HELPER.getCredentials(...)
