@@ -6,13 +6,17 @@ rules:
 
         - `defaultClient()`, which is documented to use
           DefaultAWSCredentialsProviderChain; and
+        - a client built with the default provider chain handed to it
+          explicitly (`new AmazonS3Client(new
+          DefaultAWSCredentialsProviderChain(), cfg)`, or a builder given
+          `withCredentials(new DefaultAWSCredentialsProviderChain())`); and
         - `withCredentials(...)` fed directly by a credential lookup
           (`CredentialsProvider.findCredentialById` / `lookupCredentials` /
           an AWS credentials helper) whose result is never null-checked. When
           that lookup returns null the builder keeps null credentials, and the
           SDK substitutes DefaultAWSCredentialsProviderChain.
 
-      In both cases the client authenticates with the ambient identity of the
+      In all cases the client authenticates with the ambient identity of the
       JVM: process environment variables, shared config files, web-identity
       token, and container/instance profile. In a Jenkins Builder or Publisher
       perform() (or a descriptor do* handler) that runs as the controller/node
@@ -59,3 +63,11 @@ rules:
                         - pattern: CredentialsProvider.findCredentialById(...)
                         - pattern: CredentialsProvider.lookupCredentials(...)
                         - pattern: $HELPER.getCredentials(...)
+          - patterns:
+              - pattern-either:
+                  - pattern: new $CLIENT(new DefaultAWSCredentialsProviderChain(), ...)
+                  - pattern: new $CLIENT(..., new DefaultAWSCredentialsProviderChain(), ...)
+                  - pattern: $CLIENT.withCredentials(new DefaultAWSCredentialsProviderChain())
+              - metavariable-regex:
+                  metavariable: $CLIENT
+                  regex: (?i).*(amazon|aws).*(client|clientbuilder).*
