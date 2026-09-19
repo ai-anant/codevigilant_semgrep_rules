@@ -30,6 +30,16 @@ public class StateChangePos implements Action {
     response.sendRedirect(request.getContextPath() + '/' + project.getUrl());
   }
 
+  // vulnerable: GET-reachable directory wipe, no @RequirePOST
+  public hudson.util.FormValidation doClear() {
+    try {
+      org.apache.commons.io.FileUtils.cleanDirectory(this.activityDir);
+    } catch (java.io.IOException e) {
+      return hudson.util.FormValidation.error(e, "Unable clear Activity");
+    }
+    return hudson.util.FormValidation.ok("Done. Please refresh the page.");
+  }
+
   private Executor getExecutor() {
     return null;
   }

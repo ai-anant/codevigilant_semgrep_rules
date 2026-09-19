@@ -32,6 +32,17 @@ public class StateChangeNeg implements Action {
     response.sendRedirect(request.getContextPath() + '/' + project.getUrl());
   }
 
+  // fixed: @RequirePOST present -> directory wipe not GET-reachable
+  @RequirePOST
+  public hudson.util.FormValidation doClear() {
+    try {
+      org.apache.commons.io.FileUtils.cleanDirectory(this.activityDir);
+    } catch (java.io.IOException e) {
+      return hudson.util.FormValidation.error(e, "Unable clear Activity");
+    }
+    return hudson.util.FormValidation.ok("Done. Please refresh the page.");
+  }
+
   private Executor getExecutor() {
     return null;
   }
