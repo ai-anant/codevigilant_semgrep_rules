@@ -4,17 +4,20 @@ rules:
     severity: MEDIUM
     message: >-
       A String.split(...) result is indexed at a positive literal offset
-      ($N) in the same expression, without first verifying the split-array
-      length. If the input does not contain enough separator-delimited
-      segments (e.g. a single-line payload split by a line-break regex, or a
-      value with fewer comma-separated fields than expected), the access
-      throws an uncaught ArrayIndexOutOfBoundsException. When the split input
-      is even partially attacker-influenced (file contents, log/console lines,
-      request data, structured report payloads), this is an uncaught-exception
-      denial-of-service (CWE-248 / CWE-754) that aborts the enclosing build,
-      request, or worker thread. Assign the split result to a variable, check
-      its length before indexing (and validate each field's format before
-      parsing it), so malformed input degrades gracefully instead of throwing.
+      ($N) without first verifying the split-array length - either directly on
+      the split call, or through a local variable that holds the split result.
+      If the input does not contain enough separator-delimited segments (e.g. a
+      single-line payload split by a line-break regex, a structured record with
+      fewer fields than the code assumes, or a value with fewer
+      comma-separated fields than expected), the access throws an uncaught
+      ArrayIndexOutOfBoundsException. When the split input is even partially
+      attacker-influenced (record/field values parsed out of a structured
+      message, file contents, log/console lines, request data), this is an
+      uncaught-exception denial-of-service (CWE-248 / CWE-754) that aborts the
+      enclosing build, request, or - when the code runs in a polling, listener
+      or callback thread - the whole worker loop. Check the array length before
+      indexing (and validate each field's format before parsing it), so
+      malformed input degrades gracefully instead of throwing.
     languages:
       - java
     patterns:
@@ -22,6 +25,37 @@ rules:
           - pattern: $S.split($SEP)[$N]
           - pattern: $S.split($SEP, $LIMIT)[$N]
           - pattern: $S.split($SEP)[$N].$METHOD($ARGS)
+          - pattern: $S.split($SEP, $LIMIT)[$N].$METHOD($ARGS)
+          - patterns:
+              - pattern-inside: |
+                  $ARR = $S.split($SEP, $LIMIT);
+                  ...
+              - pattern: $ARR[$N]
+              - pattern-not-inside: |
+                  if ($ARR.length < $M) {
+                    ...
+                  }
+                  ...
+              - pattern-not-inside: |
+                  if ($ARR.length <= $M) {
+                    ...
+                  }
+                  ...
+          - patterns:
+              - pattern-inside: |
+                  $ARR = $S.split($SEP);
+                  ...
+              - pattern: $ARR[$N]
+              - pattern-not-inside: |
+                  if ($ARR.length < $M) {
+                    ...
+                  }
+                  ...
+              - pattern-not-inside: |
+                  if ($ARR.length <= $M) {
+                    ...
+                  }
+                  ...
       - metavariable-regex:
           metavariable: $N
           regex: '[1-9][0-9]*'

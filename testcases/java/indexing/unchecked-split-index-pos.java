@@ -11,4 +11,10 @@ public class UncheckedSplitIndexPos {
     public String fieldChained(String row) {
         return row.split(",")[3].toUpperCase();
     }
+
+    // split result stored in a local array, then indexed without a length check
+    public String twoStep(String arn, String host, String path) {
+        String[] tokens = arn.split(":", 6);
+        return String.format(host, tokens[3]) + String.format(path, tokens[5]);
+    }
 }
