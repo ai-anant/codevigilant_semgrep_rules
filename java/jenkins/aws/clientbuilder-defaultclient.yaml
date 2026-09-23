@@ -1,8 +1,8 @@
 rules:
   - id: codevigilant.java.jenkins.aws.clientbuilder-defaultclient
     message: |
-      Detected an AWS SDK v1 `*ClientBuilder` left on the SDK default
-      credentials path instead of an explicitly bound credential:
+      Detected an AWS SDK client builder left on the SDK default credentials
+      path instead of an explicitly bound credential:
 
         - `defaultClient()`, which is documented to use
           DefaultAWSCredentialsProviderChain; and
@@ -14,7 +14,12 @@ rules:
           (`CredentialsProvider.findCredentialById` / `lookupCredentials` /
           an AWS credentials helper) whose result is never null-checked. When
           that lookup returns null the builder keeps null credentials, and the
-          SDK substitutes DefaultAWSCredentialsProviderChain.
+          SDK substitutes DefaultAWSCredentialsProviderChain; and
+        - an AWS SDK v2 builder handed its credentials provider only inside a
+          null guard (`if (p != null) { b = b.credentialsProvider(p); }`).
+          When the guard is false the builder keeps no credentials provider at
+          all and the SDK substitutes DefaultCredentialsProvider, i.e. the same
+          ambient chain as above.
 
       In all cases the client authenticates with the ambient identity of the
       JVM: process environment variables, shared config files, web-identity
@@ -34,6 +39,7 @@ rules:
       references:
         - https://www.jenkins.io/doc/developer/security/
         - https://docs.aws.amazon.com/sdk-for-java/v1/developer-guide/credentials.html
+        - https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/credentials-chain.html
       source: independent security review
       license: MIT
     languages: [java]
@@ -71,3 +77,20 @@ rules:
               - metavariable-regex:
                   metavariable: $CLIENT
                   regex: (?i).*(amazon|aws).*(client|clientbuilder).*
+          - patterns:
+              - pattern-either:
+                  - pattern: |
+                      if ($PROVIDER != null) {
+                        ...
+                        $BUILDER = $BUILDER.credentialsProvider($PROVIDER);
+                        ...
+                      }
+                  - pattern: |
+                      if ($PROVIDER != null) {
+                        ...
+                        $BUILDER.credentialsProvider($PROVIDER);
+                        ...
+                      }
+              - metavariable-regex:
+                  metavariable: $BUILDER
+                  regex: (?i)(.*(builder|client).*|b)
