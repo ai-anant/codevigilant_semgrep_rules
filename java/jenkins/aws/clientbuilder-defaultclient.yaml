@@ -19,20 +19,31 @@ rules:
           null guard (`if (p != null) { b = b.credentialsProvider(p); }`).
           When the guard is false the builder keeps no credentials provider at
           all and the SDK substitutes DefaultCredentialsProvider, i.e. the same
-          ambient chain as above.
+          ambient chain as above; and
+        - an AWS SDK v2 credentials resolution handed straight to
+          `StaticCredentialsProvider.create(...)` without a null check. A
+          Jenkins AWS credential that carries no access key/secret and no role
+          to assume resolves to null by contract, and the static provider
+          rejects null with a NullPointerException, so the credential-resolution
+          helper crashes instead of failing closed (or falling back explicitly)
+          and the intended fallback path is never reached.
 
-      In all cases the client authenticates with the ambient identity of the
-      JVM: process environment variables, shared config files, web-identity
-      token, and container/instance profile. In a Jenkins Builder or Publisher
-      perform() (or a descriptor do* handler) that runs as the controller/node
-      identity, so anyone able to configure or trigger the job inherits an AWS
-      identity that was never selected for it, silently bypassing the intended
-      least-privilege binding. Bind an explicit credentials-plugin credential,
-      resolve it into a local variable, and fail closed when it is null before
-      building the client.
+      In the first four cases the client authenticates with the ambient identity
+      of the JVM: process environment variables, shared config files,
+      web-identity token, and container/instance profile. In a Jenkins Builder
+      or Publisher perform() (or a descriptor do* handler) that runs as the
+      controller/node identity, so anyone able to configure or trigger the job
+      inherits an AWS identity that was never selected for it, silently
+      bypassing the intended least-privilege binding. In the last case the same
+      unresolved null instead escapes as an uncaught runtime exception on the
+      credential-resolution path (availability impact). Bind an explicit
+      credentials-plugin credential, resolve it into a local variable, and fail
+      closed when it is null before building the client or the provider.
     metadata:
       category: security
-      cwe: "CWE-269: Improper Privilege Management"
+      cwe:
+        - "CWE-269: Improper Privilege Management"
+        - "CWE-476: NULL Pointer Dereference"
       owasp: "A01:2021 - Broken Access Control"
       technology: jenkins
       confidence: HIGH
@@ -94,3 +105,30 @@ rules:
               - metavariable-regex:
                   metavariable: $BUILDER
                   regex: (?i)(.*(builder|client).*|b)
+          - patterns:
+              - pattern-either:
+                  - pattern: StaticCredentialsProvider.create($C.resolveCredentials())
+                  - pattern: |
+                      $CREDS = $C.resolveCredentials();
+                      ...
+                      StaticCredentialsProvider.create($CREDS);
+              - pattern-not: |
+                  $CREDS = $C.resolveCredentials();
+                  ...
+                  if ($CREDS == null) {
+                    ...
+                  }
+                  ...
+                  StaticCredentialsProvider.create($CREDS);
+              - pattern-not: |
+                  $CREDS = $C.resolveCredentials();
+                  ...
+                  if ($CREDS != null) {
+                    ...
+                    StaticCredentialsProvider.create($CREDS);
+                    ...
+                  }
+              - pattern-not: |
+                  $CREDS = Objects.requireNonNull($C.resolveCredentials(), ...);
+                  ...
+                  StaticCredentialsProvider.create($CREDS);
