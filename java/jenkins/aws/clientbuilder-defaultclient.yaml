@@ -20,6 +20,11 @@ rules:
           When the guard is false the builder keeps no credentials provider at
           all and the SDK substitutes DefaultCredentialsProvider, i.e. the same
           ambient chain as above; and
+        - an AWS SDK v2 service client built through its no-argument `create()`
+          factory (`<Service>Client.create()`), which the SDK documents as
+          loading the region from DefaultAwsRegionProviderChain and the
+          credentials from DefaultCredentialsProvider, i.e. the same ambient
+          chain, with nothing bound to the plugin; and
         - an AWS SDK v2 credentials resolution handed straight to
           `StaticCredentialsProvider.create(...)` without a null check. A
           Jenkins AWS credential that carries no access key/secret and no role
@@ -28,7 +33,7 @@ rules:
           helper crashes instead of failing closed (or falling back explicitly)
           and the intended fallback path is never reached.
 
-      In the first four cases the client authenticates with the ambient identity
+      In the first five cases the client authenticates with the ambient identity
       of the JVM: process environment variables, shared config files,
       web-identity token, and container/instance profile. In a Jenkins Builder
       or Publisher perform() (or a descriptor do* handler) that runs as the
@@ -132,3 +137,8 @@ rules:
                   $CREDS = Objects.requireNonNull($C.resolveCredentials(), ...);
                   ...
                   StaticCredentialsProvider.create($CREDS);
+          - patterns:
+              - pattern-inside: |
+                  import software.amazon.awssdk.services.$PKG.$CLIENT;
+                  ...
+              - pattern: $CLIENT.create()
