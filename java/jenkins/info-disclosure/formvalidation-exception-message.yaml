@@ -6,6 +6,8 @@ rules:
           - pattern: FormValidation.error($E.getMessage())
           - pattern: FormValidation.error("..." + $E.getMessage() + ...)
           - pattern: FormValidation.warning("..." + $E.getMessage())
+          - pattern: FormValidation.error($E, $E.getMessage())
+          - pattern: FormValidation.warning($E, $E.getMessage())
       - pattern-not: FormValidation.error("...")
     message: |
       Detected a Stapler form-validation handler that returns a raw exception
