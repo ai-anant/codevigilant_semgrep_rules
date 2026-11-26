@@ -15,12 +15,16 @@ to extract the vulnerability pattern, then check if our existing rules cover
 that pattern type. We only generate new rules for genuinely uncovered patterns.
 """
 
+import csv
+import html as html_lib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -33,6 +37,14 @@ STATE_FILE = REPO_DIR / ".wp_cve_state.json"
 SEMPEG_BIN = "/root/venv/bin/semgrep"
 TRACKING_ISSUE = 1
 RULES_DIR = REPO_DIR / "php"
+
+# Monitoring windows
+LOOKBACK_DAYS = 7          # NVD publication window
+PATCHSTACK_MAX_AGE_H = 72  # Patchstack disclosures newer than this count as "new"
+EXPLOITDB_LOOKBACK_DAYS = 21
+PATCHSTACK_PAGES = 3       # 20 rows/page on https://patchstack.com/database/
+MAX_LISTED = 15           # max findings listed per source section
+DRY_RUN = os.environ.get("WP_MONITOR_DRY", "") == "1"
 
 
 def gh_api_json(endpoint: str, json_data: str = None, method: str = "GET") -> dict:
@@ -82,23 +94,30 @@ def http_get_json(url: str, headers: dict = None, timeout: int = 30) -> Optional
 # CVE SOURCE: NVD API (WordPress plugin CVEs)
 # ─────────────────────────────────────────────
 def fetch_nvd_wordpress_cves() -> list:
-    """Search NVD for recent WordPress-related CVEs."""
+    """Search NVD for recent WordPress plugin/theme CVEs.
+
+    NOTE: the query intentionally does NOT use keywordExactMatch on
+    "wordpress plugin" — the dominant Wordfence/Patchstack phrasing is
+    "The Foo plugin for WordPress is vulnerable to ...", which that phrase
+    filter silently dropped (~80% of published WordPress CVEs).
+    We query all WordPress mentions in the window and filter on description.
+    """
     vulns = []
     end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=7)
+    start_date = end_date - timedelta(days=LOOKBACK_DAYS)
     start_index = 0
     per_page = 2000
     total = None
     fetched = 0
     while True:
-        url = (
-            f"https://services.nvd.nist.gov/rest/json/cves/2.0"
-            f"?keywordSearch=wordpress+plugin"
-            f"&keywordExactMatch"
-            f"&pubStartDate={start_date.strftime('%Y-%m-%dT00:00:00.000')}"
-            f"&pubEndDate={end_date.strftime('%Y-%m-%dT23:59:59.999')}"
-            f"&resultsPerPage={per_page}&startIndex={start_index}"
-        )
+        query = urllib.parse.urlencode({
+            "keywordSearch": "WordPress",
+            "pubStartDate": start_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00"),
+            "pubEndDate": end_date.strftime("%Y-%m-%dT%H:%M:%S.000+00:00"),
+            "resultsPerPage": per_page,
+            "startIndex": start_index,
+        })
+        url = "https://services.nvd.nist.gov/rest/json/cves/2.0?" + query
         data = http_get_json(url, timeout=60)
         if not data or "vulnerabilities" not in data:
             print("[WARN] NVD fetch failed at startIndex", start_index)
@@ -120,7 +139,7 @@ def fetch_nvd_wordpress_cves() -> list:
             vuln_type = classify_cve_type(cve)
             vuln_pattern = extract_vuln_pattern(desc, vuln_type)
 
-            if plugin_slug and vuln_type != "unknown":
+            if plugin_slug and vuln_type != "unknown" and is_wp_extension_desc(desc):
                 vulns.append({
                     "cve_id": cve_id,
                     "plugin_slug": plugin_slug,
@@ -133,21 +152,41 @@ def fetch_nvd_wordpress_cves() -> list:
         if fetched >= total or not batch:
             break
         start_index += len(batch)
-    print(f"[INFO] NVD API: {len(vulns)} WordPress CVEs found")
+    print(f"[INFO] NVD API: {len(vulns)} WordPress plugin/theme CVEs found")
     return vulns
+
+
+WP_EXT_RE = re.compile(
+    r"(?:plugin|theme)\s+(?:for\s+WordPress|for\s+the\s+WordPress)|"
+    r"WordPress\s+(?:plugin|theme)|"
+    r"WordPress\s+(?:plugin|theme)\s+(?:before|through|up\s+to)",
+    re.IGNORECASE,
+)
+
+
+def is_wp_extension_desc(desc: str) -> bool:
+    """True when the CVE description is about a WordPress plugin or theme."""
+    if not desc:
+        return False
+    return bool(WP_EXT_RE.search(desc)) or (
+        "wordpress" in desc.lower() and re.search(r"\b(?:plugin|theme)\b", desc, re.I) is not None
+    )
 
 
 def extract_plugin_from_cve_desc(desc: str) -> Optional[str]:
     """Extract WordPress plugin slug from CVE description."""
     patterns = [
+        # Dominant Wordfence/WPScan phrasing:
+        # "The Foo Bar plugin for WordPress is vulnerable to ..."
+        r'\bThe\s+([A-Za-z0-9][A-Za-z0-9 \-\_&\.\,\+\u2013\u2014<>=]{1,90}?)\s+(?:plugin|theme)\s+for\s+WordPress',
+        # "The Foo Bar <= 1.2.3 plugin ..." / "The Foo plugin (versions ...)"
+        r'\bThe\s+([A-Za-z0-9][A-Za-z0-9 \-\_&\.\,\+\u2013\u2014<>=]{1,90}?)\s+(?:plugin|theme)\b',
+        # "WordPress plugin "Foo" before 1.2"
+        r'WordPress\s+plugin\s+[\"\'\u201c]([A-Za-z0-9 \-\_\.]{2,60})[\"\'\u201d]',
         # Multi-word names: "The Ultimate Member WordPress plugin before 2.12.1"
         r'(?:The\s+)?([A-Z][A-Za-z0-9]+(?:\s+[A-Za-z0-9]+){1,4})\s+WordPress\s+plugin\s+(?:before|through|up to|prior)',
-        r'WordPress\s+plugin\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to|prior)',
-        r'["\']?([a-zA-Z0-9_-]+)["\']?\s+WordPress\s+plugin\s+(?:before|through|up to)',
-        r'plugin\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to|prior)',
-        r'([A-Z][a-zA-Z0-9_-]+)\s+Plugin\s+(?:before|through|up to)',
-        r'in\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to|prior)',
-        r'affects?\s+["\']?([a-zA-Z0-9_-]+)["\']?\s+(?:before|through|up to)',
+        # "vulnerability in the Foo plugin" / "in Foo before 1.2"
+        r'\bin\s+the\s+([A-Za-z0-9][A-Za-z0-9 \-\_&\.\,\+\u2013\u2014<>=]{1,70}?)\s+plugin\b',
     ]
     false_positives = {
         'before', 'through', 'to', 'the', 'and', 'or', 'in', 'on',
@@ -155,18 +194,32 @@ def extract_plugin_from_cve_desc(desc: str) -> Optional[str]:
         'not', 'may', 'can', 'could', 'would', 'should', 'will',
         'wordpress', 'plugin', 'theme', 'vulnerability', 'vulnerabilities',
         'allowing', 'allow', 'remote', 'local', 'file', 'code', 'attack',
+        # junk captured by loose patterns
+        'versions', 'version', 'files', 'file', 'approve', 'up', 'includes',
+        'including', 'order', 'orders', 'is', 'it', 'its', 'their', 'a', 'an',
+        'following', 'certain', 'some', 'these', 'those', 'which', 'when',
+        'authenticated', 'unauthenticated', 'subscriber', 'contributor',
     }
     for pattern in patterns:
         match = re.search(pattern, desc, re.IGNORECASE)
         if match:
             slug = match.group(1).lower().strip()
+            # Drop a trailing version only when it actually looks like one (has a dot)
+            slug = re.sub(r'\s*(?:<=\s*)?v?\d+(?:\.\d+)+\S*$', '', slug).strip(' .-\u2013\u2014&')
+            # Cut marketing taglines: 'Nelio Content - Editorial Calendar' -> 'nelio-content'
+            slug = re.split(r'\s+[\u2013\u2014]\s+|\s+-\s+|\s*\u0026\s*', slug)[0].strip()
             # Normalize multi-word names to kebab-case (e.g. "Ultimate Member" -> "ultimate-member")
             slug = re.sub(r'\s+', '-', slug)
             # Drop a captured leading article ("The GiveWP" -> "givewp")
             if slug.startswith('the-') and len(slug) > 5:
                 slug = slug[4:]
-            if slug not in false_positives and len(slug) > 2:
-                return slug
+            # Drop a trailing "wordpress" captured inside a multi-word name
+            slug = re.sub(r'(-wordpress|-plugin)$', '', slug)
+            if slug in false_positives or len(slug) < 3:
+                continue
+            if re.fullmatch(r'[\d\.\-]+', slug):
+                continue
+            return slug
     return None
 
 
@@ -186,6 +239,8 @@ def classify_cve_type(cve: dict) -> str:
         "rce": ["remote code execution", "rce", "command injection", "code injection"],
         "ssrf": ["server-side request forgery", "ssrf"],
         "lfi": ["local file inclusion", "path traversal", "directory traversal"],
+        "file_deletion": ["arbitrary file deletion", "arbitrary file delete",
+                          "file deletion", "deletes arbitrary files"],
         "rfi": ["remote file inclusion"],
         "deserialization": ["deserialization", "insecure deserialization", "unserialize"],
         "csrf": ["cross-site request forgery", "csrf", "nonce check", "nonce checks",
@@ -207,7 +262,12 @@ def classify_cve_type(cve: dict) -> str:
     }
     for vuln_type, keywords in type_keywords.items():
         for kw in keywords:
-            if kw in desc_text:
+            # Short tokens ("rce", "otp", "xss") must match whole words — plain
+            # substring matching classified "source" as RCE ("...rce").
+            if len(kw) <= 6 and re.fullmatch(r"[a-z0-9_-]+", kw):
+                if re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])", desc_text):
+                    return vuln_type
+            elif kw in desc_text:
                 return vuln_type
     return "unknown"
 
@@ -279,6 +339,171 @@ def extract_vuln_pattern(desc: str, vuln_type: str) -> str:
 
 
 # ─────────────────────────────────────────────
+# SOURCE 2: Patchstack vulnerability database (disclosures, incl. non-CVE)
+# ─────────────────────────────────────────────
+PS_ROW_RE = re.compile(r'<tr class="group.*?</tr>', re.S)
+PS_LINK_RE = re.compile(
+    r'href="/database/wordpress/(plugin|theme)/([^/"]+)/vulnerability/([^"]+)"')
+REL_TIME_RE = re.compile(
+    r'(\d+)\s*(minute|min|hour|hr|day|week)s?\s+ago|(\d{2})/(\d{2})/(\d{4})', re.I)
+
+
+def _fetch_html(url: str, timeout: int = 45) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"[WARN] HTTP GET {url}: {e}")
+        return ""
+
+
+def _age_hours(txt: str):
+    """Parse '3 hours ago' / '04/12/2026' into age in hours (None if unknown)."""
+    m = REL_TIME_RE.search(txt)
+    if not m:
+        return None
+    if m.group(1):
+        n, unit = int(m.group(1)), m.group(2).lower()
+        return n * {"minute": 1 / 60, "min": 1 / 60, "hour": 1,
+                    "hr": 1, "day": 24, "week": 168}[unit]
+    d, mo, y = int(m.group(3)), int(m.group(4)), int(m.group(5))
+    try:
+        dt = datetime(y, mo, d, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+
+def _kw_hit(text: str, kw: str) -> bool:
+    """Keyword match that keeps short tokens ('rce', 'xss') on word boundaries.
+
+    Plain substring matching classified "WooCommerce" / "source" as RCE.
+    """
+    if len(kw) <= 6 and re.fullmatch(r"[a-z0-9_-]+", kw):
+        return re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])", text) is not None
+    return kw in text
+
+
+def classify_text_type(text: str) -> str:
+    """Classify vulnerability type from an advisory title."""
+    t = text.lower()
+    ordered = [
+        ("sql_injection", ["sql injection", "sqli"]),
+        ("deserialization", ["deserialization", "unserialize", "object injection"]),
+        ("rce", ["remote code execution", "rce", "code execution", "command injection",
+                 "code injection", "arbitrary file upload", "file upload"]),
+        ("ssrf", ["server-side request forgery", "ssrf"]),
+        ("file_deletion", ["arbitrary file deletion", "file deletion", "delete files",
+                           "unlink"]),
+        ("lfi", ["local file inclusion", "path traversal", "directory traversal",
+                 "file inclusion"]),
+        ("xss", ["cross-site scripting", "xss"]),
+        ("csrf", ["cross-site request forgery", "csrf"]),
+        ("idor", ["insecure direct object reference", "idor",
+                  "broken access control", "missing authorization",
+                  "missing capability", "arbitrary post", "arbitrary option"]),
+        ("privilege_escalation", ["privilege escalation", "subscriber", "contributor",
+                                  "admin+", "authentication bypass",
+                                  "broken authentication"]),
+        ("information_disclosure", ["sensitive information", "information disclosure",
+                                    "information exposure", "exposure of sensitive"]),
+        ("auth_bypass", ["otp", "one-time password", "password reset"]),
+        ("subscriber_data_access", ["export", "backup"]),
+    ]
+    for vtype, kws in ordered:
+        if any(_kw_hit(t, k) for k in kws):
+            return vtype
+    return "unknown"
+
+
+def fetch_patchstack_disclosures() -> list:
+    """Scrape the Patchstack database listing (most recent disclosures first)."""
+    out = []
+    for page in range(1, PATCHSTACK_PAGES + 1):
+        url = "https://patchstack.com/database/" + (f"?page={page}" if page > 1 else "")
+        html = _fetch_html(url)
+        if not html:
+            continue
+        rows = PS_ROW_RE.findall(html)
+        print(f"[INFO] Patchstack page {page}: {len(rows)} rows")
+        for row in rows:
+            link = PS_LINK_RE.search(row)
+            if not link:
+                continue
+            kind, slug, vuln_path = link.group(1), link.group(2), link.group(3)
+            text = re.sub(r"<[^>]+>", " ", row)
+            text = re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
+            age_h = _age_hours(text)
+            if age_h is None or age_h > PATCHSTACK_MAX_AGE_H:
+                continue
+            title = PS_TITLE_RE.sub(" ", text.split("vulnerability")[0]).strip()
+            title = re.sub(r"\s+", " ", title).strip(" |")
+            exploited = bool(re.search(r"exploited in the wild|actively exploited", text, re.I))
+            version = (re.search(r"<=\s*([\w\.\-]+)", title) or [None, ""])[1]
+            out.append({
+                "id": f"PATCHSTACK-{slug}-{vuln_path[:60]}",
+                "plugin_slug": slug,
+                "kind": kind,
+                "title": title,
+                "display": f"{slug} {version}".strip(),
+                "vuln_type": classify_text_type(title),
+                "age_hours": round(age_h, 1),
+                "is_exploited": exploited,
+                "url": f"https://patchstack.com/database/wordpress/{kind}/{slug}/vulnerability/{vuln_path}",
+                "source": "patchstack",
+            })
+    print(f"[INFO] Patchstack: {len(out)} disclosures within {PATCHSTACK_MAX_AGE_H}h")
+    return out
+
+
+PS_TITLE_RE = re.compile(r"^\s*[\d.]+\s*")
+
+
+# ─────────────────────────────────────────────
+# SOURCE 3: Exploit-DB (public exploit code)
+# ─────────────────────────────────────────────
+def fetch_exploitdb_wordpress() -> list:
+    """Recent Exploit-DB entries that target WordPress plugins/themes."""
+    url = "https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv"
+    csv_text = _fetch_html(url, timeout=120)
+    if not csv_text:
+        print("[WARN] Exploit-DB CSV unavailable")
+        return []
+    out = []
+    today = datetime.now(timezone.utc).date()
+    for r in csv.DictReader(io.StringIO(csv_text)):
+        d = None
+        for field in ("date_added", "date_published"):
+            try:
+                d = datetime.strptime((r.get(field) or "").strip(), "%Y-%m-%d").date()
+                break
+            except ValueError:
+                continue
+        if not d or (today - d).days > EXPLOITDB_LOOKBACK_DAYS:
+            continue
+        blob = " ".join((r.get(k) or "") for k in ("description", "tags", "file", "platform")).lower()
+        if "wordpress" not in blob and "woocommerce" not in blob:
+            continue
+        out.append({
+            "id": f"EDB-{r.get('id')}",
+            "plugin_slug": (r.get("description") or "")[:60],
+            "title": r.get("description", ""),
+            "vuln_type": classify_text_type(r.get("description", "")),
+            "date": str(d),
+            "url": f"https://www.exploit-db.com/exploits/{r.get('id')}",
+            "source": "exploitdb",
+            "is_exploited": True,
+        })
+    print(f"[INFO] Exploit-DB: {len(out)} WordPress exploits in last {EXPLOITDB_LOOKBACK_DAYS}d")
+    return out
+
+
+# ─────────────────────────────────────────────
 # EXISTING RULE ANALYSIS
 # ─────────────────────────────────────────────
 def load_existing_rules() -> dict:
@@ -315,52 +540,58 @@ def analyze_coverage(vuln_type: str, vuln_pattern: str, existing_rules: dict) ->
     """Determine if existing rules would catch this vulnerability pattern."""
     # Map vuln types to rule categories that should cover them
     category_mapping = {
+        # rule_patterns are substrings of real rule ids (php/**/*.yaml); they are
+        # the only coverage signal — keep them in sync with the rule inventory.
         "sql_injection": {
-            "rule_patterns": ["getpost", "cookie", "server", "user_agent", "sqli", "prepared", "wpdb", "restricted-db"],
-            "pattern_keywords": ["wpdb", "query", "prepare", "sql", "select", "insert", "update", "delete"],
+            "rule_patterns": ["sqli", "wpdb", "direct_db_query"],
+            "pattern_keywords": ["wpdb", "query", "prepare", "sql"],
         },
         "xss": {
-            "rule_patterns": ["basic_xss", "output-escaping", "variables_substitutes", "filtered_add_query_arg", "esc_"],
-            "pattern_keywords": ["echo", "print", "html", "script", "esc_html", "esc_attr", "output"],
+            "rule_patterns": ["xss"],
+            "pattern_keywords": ["echo", "print", "esc_html", "esc_attr"],
         },
         "rce": {
-            "rule_patterns": ["rce", "dangerous-functions", "restricted-functions", "dynamic-calls"],
-            "pattern_keywords": ["eval", "exec", "system", "passthru", "shell_exec", "file_get_contents"],
+            "rule_patterns": ["rce", "dynamic_function_call", "call_user_func_user_input",
+                              "create_function"],
+            "pattern_keywords": ["eval", "exec", "system", "passthru", "shell_exec"],
         },
         "ssrf": {
-            "rule_patterns": ["ssrf", "restricted-functions", "file_get_contents"],
-            "pattern_keywords": ["file_get_contents", "curl", "wp_remote", "fopen", "get_headers"],
+            "rule_patterns": ["ssrf"],
+            "pattern_keywords": ["file_get_contents", "curl", "wp_remote", "fsockopen"],
         },
         "lfi": {
-            "rule_patterns": ["dynamic-include", "restricted-functions", "file_inclusion"],
-            "pattern_keywords": ["include", "require", "file_get_contents", "path", "directory"],
+            "rule_patterns": ["lfi", "dynamic_include"],
+            "pattern_keywords": ["include", "require", "path", "directory"],
+        },
+        "file_deletion": {
+            "rule_patterns": ["file_deletion", "unlink", "wp_delete_file"],
+            "pattern_keywords": ["unlink", "delete file"],
         },
         "csrf": {
-            "rule_patterns": ["csrf", "nonce-verification", "restricted-hooks"],
-            "pattern_keywords": ["nonce", "verify", "wp_nonce", "ajax", "admin_post"],
+            "rule_patterns": ["csrf", "nonce"],
+            "pattern_keywords": ["nonce", "verify", "wp_nonce"],
         },
         "privilege_escalation": {
-            "rule_patterns": ["capabilities", "global-override", "restricted-functions"],
-            "pattern_keywords": ["capability", "role", "privilege", "option", "user"],
+            "rule_patterns": ["auth.", "capabilit", "global_override"],
+            "pattern_keywords": ["capability", "role", "privilege"],
         },
         "deserialization": {
-            "rule_patterns": ["deserialize", "restricted-functions"],
-            "pattern_keywords": ["unserialize", "serialize", "maybe_unserialize"],
+            "rule_patterns": ["deserial", "unserialize"],
+            "pattern_keywords": ["unserialize", "maybe_unserialize"],
         },
         "idor": {
-            "rule_patterns": ["capabilities", "nonce-verification", "restricted-hooks", "authorization"],
-            "pattern_keywords": ["nonce", "capability", "current_user_can", "authorization", "permission"],
+            "rule_patterns": ["auth.", "current_user_can", "capabilit"],
+            "pattern_keywords": ["capability", "current_user_can", "authorization"],
         },
         "information_disclosure": {
-            "rule_patterns": ["restricted-functions", "file", "directory", "path"],
-            "pattern_keywords": ["file_get_contents", "fopen", "backup", "export", "readfile"],
+            "rule_patterns": ["info_disclosure", "information"],
+            "pattern_keywords": ["phpinfo", "var_dump", "print_r", "backtrace"],
         },
         "auth_bypass": {
-            "rule_patterns": ["capabilities", "nonce-verification", "restricted-hooks", "authentication"],
-            "pattern_keywords": ["nonce", "capability", "auth", "current_user_can", "login"],
+            "rule_patterns": ["auth.", "password", "login"],
+            "pattern_keywords": ["auth", "login", "otp"],
         },
     }
-
     mapping = category_mapping.get(vuln_type, {})
     if not mapping:
         return {"covered": False, "coverage_type": "no_mapping", "matching_rules": []}
@@ -368,23 +599,14 @@ def analyze_coverage(vuln_type: str, vuln_pattern: str, existing_rules: dict) ->
     relevant_patterns = mapping.get("rule_patterns", [])
     relevant_keywords = mapping.get("pattern_keywords", [])
 
-    # Find rules that match this vulnerability type
+    # Find rules that match this vulnerability type by rule-id substring.
+    # NOTE: an earlier version also matched free-text patterns scraped from the
+    # whole YAML file, which made nearly every finding look "strongly covered"
+    # (e.g. RCE matching sqli rules). Rule-id matching is the honest signal.
     matching_rules = []
-    for rule_id, rule_data in existing_rules.items():
-        rule_id_lower = rule_id.lower()
-        rule_patterns_str = " ".join(rule_data.get("patterns", [])).lower()
-
-        # Check if rule matches by pattern name
-        for pattern in relevant_patterns:
-            if pattern in rule_id_lower:
-                matching_rules.append(rule_id)
-                break
-        else:
-            # Check if rule matches by pattern content
-            for keyword in relevant_keywords:
-                if keyword in rule_patterns_str:
-                    matching_rules.append(rule_id)
-                    break
+    for rule_id in existing_rules:
+        if any(p in rule_id.lower() for p in relevant_patterns):
+            matching_rules.append(rule_id)
 
     # Determine coverage quality
     if len(matching_rules) >= 3:
@@ -404,44 +626,83 @@ def analyze_coverage(vuln_type: str, vuln_pattern: str, existing_rules: dict) ->
 # ─────────────────────────────────────────────
 # TRACKING ISSUE COMMENT
 # ─────────────────────────────────────────────
-def update_tracking_issue(vulns: list, analyses: list):
-    """Add a comment to the tracking issue with CVE analysis results."""
+def render_item(vuln: dict, coverage: dict) -> str:
+    """One markdown bullet describing an analysed item."""
+    label = vuln.get("cve_id") or vuln.get("display") or vuln.get("id", "?")
+    flag = " 🚨 **ACTIVELY EXPLOITED**" if vuln.get("is_exploited") else ""
+    slug = vuln.get("plugin_slug", "?")
+    vtype = vuln.get("vuln_type", "unknown")
+    line = f"- **{label}** — `{slug}` ({vtype}){flag}\n"
+    if vuln.get("vuln_pattern"):
+        line += f"  - Pattern: {vuln['vuln_pattern']}\n"
+    if vuln.get("title") and vuln.get("source") != "nvd":
+        title = re.sub(r"\s+", " ", str(vuln["title"]))[:120]
+        line += f"  - Advisory: {title}\n"
+    if coverage:
+        rules = ", ".join(f"`{r}`" for r in coverage["matching_rules"][:3])
+        line += (f"  - Coverage: {coverage['coverage_type']} "
+                 f"({len(coverage['matching_rules'])} rules)"
+                 + (f" — {rules}" if rules else "") + "\n")
+    if vuln.get("url"):
+        line += f"  - Source: <{vuln['url']}>\n"
+    return line
+
+
+def update_tracking_issue(sections: dict, counts: dict):
+    """Add one comment to the tracking issue, broken out per source channel."""
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    body = f"## 📊 WP Vuln Monitor — {timestamp}\n\n"
+    body += (f"**New items**: {counts['total']} "
+             f"(NVD {counts['nvd']} · Patchstack {counts['patchstack']} · Exploit-DB {counts['edb']})  \n")
+    body += f"**Caught by existing rules**: {counts['caught']}  \n"
+    body += f"**Not covered (new rules needed)**: {counts['missed']}\n"
 
-    caught = [a for a in analyses if a["coverage"]["covered"]]
-    missed = [a for a in analyses if not a["coverage"]["covered"]]
+    titles = {
+        "nvd": "1️⃣ NVD CVEs",
+        "patchstack": "2️⃣ Patchstack disclosures",
+        "exploitdb": "3️⃣ Exploit-DB exploits",
+    }
+    for key in ("nvd", "patchstack", "exploitdb"):
+        items = sections.get(key, [])
+        if not items:
+            body += f"\n### {titles[key]}\n\n_None new in this cycle._\n"
+            continue
+        caught = [i for i in items if i["coverage"]["covered"]]
+        missed = [i for i in items if not i["coverage"]["covered"]]
+        exploited = [i for i in items if i["vuln"].get("is_exploited")]
+        type_counts = {}
+        for i in items:
+            t = i["vuln"].get("vuln_type", "unknown")
+            type_counts[t] = type_counts.get(t, 0) + 1
+        summary = ", ".join(f"{t} {n}" for t, n in sorted(type_counts.items(), key=lambda x: -x[1]))
+        body += f"\n### {titles[key]} — {len(items)} new\n\n"
+        body += f"_By type: {summary}_\n\n"
 
-    body = f"## 📊 CVE Scan Results — {timestamp}\n\n"
-    body += f"**CVEs Analyzed**: {len(vulns)}\n"
-    body += f"**Caught by existing rules**: {len(caught)}\n"
-    body += f"**Not covered (new rules needed)**: {len(missed)}\n\n"
+        # Uncovered + exploited are always listed; covered items are sampled to
+        # keep the comment under GitHub's size limit on busy days.
+        show = missed + [i for i in exploited if i not in missed][:MAX_LISTED]
+        if show:
+            body += "**❌ Not covered / actively exploited**\n\n"
+            body += "".join(render_item(i["vuln"], i["coverage"] if i["coverage"]["covered"] else None)
+                            + "\n" for i in show)
+        remaining = [i for i in caught if i not in show]
+        if remaining:
+            body += f"**✅ Covered by existing rules** ({len(remaining)})\n\n"
+            body += "".join(render_item(i["vuln"], i["coverage"]) + "\n"
+                            for i in remaining[:MAX_LISTED])
+            if len(remaining) > MAX_LISTED:
+                body += f"\n_…and {len(remaining) - MAX_LISTED} more covered findings (all recorded in monitor state)._\n"
 
-    if caught:
-        body += "### ✅ Detected by Existing Rules\n\n"
-        for a in caught:
-            vuln = a["vuln"]
-            coverage = a["coverage"]
-            body += f"- **{vuln['cve_id']}** — `{vuln['plugin_slug']}` ({vuln['vuln_type']})\n"
-            body += f"  - Pattern: {vuln['vuln_pattern']}\n"
-            body += f"  - Coverage: {coverage['coverage_type']} ({len(coverage['matching_rules'])} rules)\n"
-            body += f"  - Matching rules: {', '.join(f'`{r}`' for r in coverage['matching_rules'][:3])}\n"
-            body += f"  - Source: <{vuln['url']}>\n\n"
+    body += "\n---\n*Auto-generated by WordPress Vulnerability Monitor (NVD + Patchstack + Exploit-DB)*\n"
 
-    if missed:
-        body += "### ❌ Not Covered — New Rules Needed\n\n"
-        for a in missed:
-            vuln = a["vuln"]
-            body += f"- **{vuln['cve_id']}** — `{vuln['plugin_slug']}` ({vuln['vuln_type']})\n"
-            body += f"  - Pattern: {vuln['vuln_pattern']}\n"
-            body += f"  - Source: <{vuln['url']}>\n"
-            body += f"  - Recommended: Create rule for `{vuln['vuln_type']}` covering `{vuln['vuln_pattern']}`\n\n"
-
-    body += "---\n*Auto-generated by WordPress CVE Monitor*\n"
-
+    if DRY_RUN:
+        Path("/tmp/comment_body.md").write_text(body)
+        print(f"[DRY] comment body chars={len(body)} -> /tmp/comment_body.md")
+        return
     comment = gh_api_json(
-        "repos/ai-anant/codevigilant_semgrep_rules/issues/1/comments",
+        f"repos/ai-anant/codevigilant_semgrep_rules/issues/{TRACKING_ISSUE}/comments",
         json.dumps({"body": body}),
-        method="POST"
+        method="POST",
     )
     if comment:
         print(f"[INFO] Added comment to issue #{TRACKING_ISSUE}")
@@ -451,78 +712,106 @@ def update_tracking_issue(vulns: list, analyses: list):
 # MAIN WORKFLOW
 # ─────────────────────────────────────────────
 def main():
-    print(f"[INFO] WordPress CVE Monitor starting at {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    print(f"[INFO] WordPress Vulnerability Monitor starting at "
+          f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
     state = load_state()
     processed = set(state.get("processed_cves", []))
+    seen_disc = set(state.get("seen_disclosures", []))
+    seen_expl = set(state.get("seen_exploits", []))
 
-    # 1. Fetch CVEs from NVD
-    all_vulns = fetch_nvd_wordpress_cves()
+    # ── 1. Collect from all three channels ──────────────────────────────
+    nvd_all = fetch_nvd_wordpress_cves()
+    ps_all = fetch_patchstack_disclosures()
+    edb_all = fetch_exploitdb_wordpress()
 
-    # Deduplicate and filter already processed
-    seen = set()
-    new_vulns = []
-    for v in all_vulns:
-        cve_id = v.get("cve_id", "")
-        if cve_id and cve_id not in processed and cve_id not in seen:
-            seen.add(cve_id)
-            new_vulns.append(v)
+    new_nvd, new_ps, new_edb = [], [], []
+    seen_ids = set()
+    for v in nvd_all:
+        cid = v.get("cve_id", "")
+        if cid and cid not in processed and cid not in seen_ids:
+            seen_ids.add(cid)
+            v["source"] = "nvd"
+            v["cve_id"] = cid
+            new_nvd.append(v)
 
-    if not new_vulns:
-        print("[INFO] No new CVEs found since last check.")
+    seen_ids.clear()
+    for d in ps_all:
+        did = d["id"]
+        # A disclosure whose CVE was already reported via NVD is not "new"
+        if did in seen_disc or did in seen_ids:
+            continue
+        seen_ids.add(did)
+        new_ps.append(d)
+
+    seen_ids.clear()
+    for e in edb_all:
+        eid = e["id"]
+        if eid in seen_expl or eid in seen_ids:
+            continue
+        seen_ids.add(eid)
+        new_edb.append(e)
+
+    total_new = len(new_nvd) + len(new_ps) + len(new_edb)
+    print(f"[INFO] New: NVD={len(new_nvd)} Patchstack={len(new_ps)} Exploit-DB={len(new_edb)}")
+
+    if not total_new:
+        print("[INFO] No new WordPress CVEs / disclosures / exploits detected in this cycle.")
         save_state(state)
         return
 
-    print(f"[INFO] Found {len(new_vulns)} new CVEs to analyze")
-
-    # 2. Load existing rules
+    # ── 2. Coverage analysis ────────────────────────────────────────────
     existing_rules = load_existing_rules()
     print(f"[INFO] Loaded {len(existing_rules)} existing rules")
 
-    # 3. Analyze each CVE against existing rules
-    analyses = []
-    for vuln in new_vulns:
-        cve_id = vuln.get("cve_id", "unknown")
-        vuln_type = vuln.get("vuln_type", "unknown")
-        vuln_pattern = vuln.get("vuln_pattern", "")
+    def analyse(items):
+        out = []
+        for v in items:
+            vtype = v.get("vuln_type", "unknown")
+            cov = analyze_coverage(vtype, v.get("vuln_pattern", ""), existing_rules)
+            status = "CAUGHT" if cov["covered"] else "MISSED"
+            print(f"  {'✅' if cov['covered'] else '❌'} {v.get('cve_id') or v.get('id')} "
+                  f"[{vtype}] -> {status} ({cov['coverage_type']}, {len(cov['matching_rules'])} rules)")
+            out.append({"vuln": v, "coverage": cov})
+        return out
 
-        print(f"[INFO] Analyzing {cve_id} ({vuln_type})...")
-        print(f"       Pattern: {vuln_pattern}")
+    sections = {
+        "nvd": analyse(new_nvd),
+        "patchstack": analyse(new_ps),
+        "exploitdb": analyse(new_edb),
+    }
+    flat = [i for s in sections.values() for i in s]
+    caught_n = sum(1 for i in flat if i["coverage"]["covered"])
 
-        coverage = analyze_coverage(vuln_type, vuln_pattern, existing_rules)
+    # ── 3. Report ───────────────────────────────────────────────────────
+    update_tracking_issue(sections, {
+        "total": total_new,
+        "nvd": len(new_nvd),
+        "patchstack": len(new_ps),
+        "edb": len(new_edb),
+        "caught": caught_n,
+        "missed": len(flat) - caught_n,
+    })
 
-        status = "✅ CAUGHT" if coverage["covered"] else "❌ MISSED"
-        print(f"       Result: {status} ({coverage['coverage_type']}, {len(coverage['matching_rules'])} rules)")
+    # ── 4. Persist state ────────────────────────────────────────────────
+    processed.update(v["cve_id"] for v in new_nvd)
+    seen_disc.update(d["id"] for d in new_ps)
+    seen_expl.update(e["id"] for e in new_edb)
+    state["processed_cves"] = sorted(processed)
+    state["seen_disclosures"] = sorted(seen_disc)
+    state["seen_exploits"] = sorted(seen_expl)
+    if DRY_RUN:
+        print("[DRY] state not saved")
+    else:
+        save_state(state)
 
-        analyses.append({
-            "vuln": vuln,
-            "coverage": coverage,
-        })
-
-        # Mark as processed
-        processed.add(cve_id)
-
-    # 4. Update tracking issue
-    update_tracking_issue(new_vulns, analyses)
-
-    # 5. Save state
-    state["processed_cves"] = list(processed)
-    save_state(state)
-
-    # Summary
-    caught_count = sum(1 for a in analyses if a["coverage"]["covered"])
-    missed_count = len(analyses) - caught_count
-    print(f"\n[DONE] Analysis complete:")
-    print(f"  - CVEs analyzed: {len(new_vulns)}")
-    print(f"  - Caught by existing rules: {caught_count}")
-    print(f"  - Not covered: {missed_count}")
-
-    if missed_count > 0:
-        print(f"\n  Missed CVEs need new rules:")
-        for a in analyses:
-            if not a["coverage"]["covered"]:
-                v = a["vuln"]
-                print(f"    - {v['cve_id']}: {v['plugin_slug']} ({v['vuln_type']})")
-                print(f"      Pattern: {v['vuln_pattern']}")
+    print("\n[DONE]")
+    print(f"  - analysed: {total_new} (NVD {len(new_nvd)}, Patchstack {len(new_ps)}, EDB {len(new_edb)})")
+    print(f"  - caught: {caught_n}   not covered: {len(flat) - caught_n}")
+    for i in flat:
+        if not i["coverage"]["covered"]:
+            v = i["vuln"]
+            print(f"    MISSED {v.get('cve_id') or v.get('id')}: "
+                  f"{v.get('plugin_slug')} ({v.get('vuln_type')})")
 
 
 if __name__ == "__main__":
