@@ -1,0 +1,61 @@
+rules:
+  # ============================================================================
+  # FILE WRITE TO A PATH BUILT FROM A NON-LITERAL, UNVALIDATED VALUE
+  # (CWE-22 Path Traversal / CWE-73 External Control of File Name or Path)
+  # Generic shape: a build step takes a non-literal value - a job/build
+  # environment entry, a configuration string, anything carried in from outside
+  # the method - turns it into a path with Paths.get($V) and passes that same
+  # path to Files.write(...) without normalising it or checking that the resolved
+  # path stays under the intended base directory. Whoever controls that value
+  # chooses where the build writes, so files can be planted outside the workspace
+  # (startup scripts, shell rc files, authorized_keys, cron entries) with the
+  # build user's privileges.
+  # ============================================================================
+
+  - id: codevigilant.java.jenkins.path-traversal.unvalidated-write-path
+    message: >-
+      A file is written to Paths.get($V), where $V is a non-literal value that is
+      used without normalisation and without a check that the resolved path stays
+      under the intended base directory. When that value comes from the build
+      environment or from job configuration, an actor who can set it chooses the
+      write destination and can create or overwrite files outside the workspace
+      under the build user's privileges (CWE-22/CWE-73). Resolve the value under a
+      fixed base directory, normalise it (`toAbsolutePath().normalize()`), verify
+      the result starts with that base, and refuse it otherwise before writing.
+    severity: ERROR
+    languages: [java]
+    patterns:
+      - pattern: Files.write($P, ...)
+      - pattern-inside: |
+          $T $M(...) {
+            ...
+            $P = Paths.get($V);
+            ...
+          }
+      - metavariable-regex:
+          metavariable: $V
+          regex: '(?![ ]*")[A-Za-z_][A-Za-z0-9_.$]*$'
+      - pattern-not-inside: |
+          $T $M(...) {
+            ...
+            if ( ... .startsWith( ... ) ) { ... }
+            ...
+          }
+      - pattern-not-inside: |
+          $T $M(...) {
+            ...
+            $P = Paths.get($V).normalize();
+            ...
+          }
+    metadata:
+      category: security
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      owasp: "A01:2021 - Broken Access Control"
+      technology: jenkins
+      confidence: MEDIUM
+      references:
+        - https://cwe.mitre.org/data/definitions/22.html
+        - https://cwe.mitre.org/data/definitions/73.html
+        - https://www.jenkins.io/doc/developer/security/access-control/
+      source: semgrep-rule-gap
+      license: MIT
